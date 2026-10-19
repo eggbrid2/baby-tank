@@ -3,7 +3,7 @@
 This is the independent ESP32-S3 firmware for the Baby Tank head. It is not
 based on an upstream ESP-SparkBot example.
 
-The `0.13.0` build extends the safe bring-up baseline with a procedural animated
+The `0.14.27` build extends the safe bring-up baseline with a procedural animated
 robot-baby face and a half-duplex voice conversation runtime:
 
 - boot through the native USB Serial/JTAG interface;
@@ -11,7 +11,7 @@ robot-baby face and a half-duplex voice conversation runtime:
 - initialize the 240x240 ST7789 over SPI3 and render a stable two-eye/one-mouth
   filled-shape identity on black, matching the approved cyan-eye/cream-mouth
   reference proportions;
-- keep a calm, living idle face at 20 FPS and expose 24 expressions and states
+- keep a calm, living idle face at 20 FPS and expose 53 expressions and states
   to trusted interaction code;
 - animate each expression as a short performance with anticipation, action,
   controlled overshoot, settle, hold, and return-to-neutral timing;
@@ -32,19 +32,19 @@ robot-baby face and a half-duplex voice conversation runtime:
   those frames to ASR as they arrive, then performs bounded dialogue and TTS
   and returns 16 kHz PCM for ES8311/I2S playback;
 - support cooperative touch barge-in during recognition, model generation, or
-  playback; leave side-touch behavior, UART, and other unfinished hardware
-  paths uninitialized;
+  playback; side touches also drive directional gaze and cloud/local reactions;
 - advertise `BabyTank-XXXX` over BLE and use Espressif Network Provisioning
   Security 1 with a per-device proof-of-possession code;
-- keep an encrypted `baby-control` endpoint available after provisioning. Its
-  versioned 8-byte protocol supports a round-trip health check now, while
-  drive/light commands remain rejected until a verified chassis backend and
-  independent 500 ms fail-safe are connected;
+- keep encrypted BLE control and diagnostic endpoints available after
+  provisioning for drive/STOP, speed, light, sound, expression, volume, remote
+  leases, camera discovery, game results, and hardware tests; UART commands are
+  bridged to the ESP32-C2 chassis with head-side expiry and STOP preemption;
 - create a WPA2 `BabyTank-XXXXXX` SoftAP for one phone, initialize the GC2145
   directly as JPEG 240x240, and serve an approximately 8 FPS MJPEG preview;
-- accept camera HTTP requests only through the SoftAP address
-  `192.168.4.1`, so the same server is not exposed through the home-Wi-Fi STA
-  interface.
+- expose local camera routes on the WPA2 SoftAP and an independently bound
+  station listener on port 8081. LAN requests require a boot-scoped token
+  obtained through encrypted BLE; the token remains stable across camera
+  restarts within the same boot.
 
 The display path and face renderer are implemented directly with ESP-IDF
 `esp_lcd`. The current runtime is geometry-only: it draws RGB565 filled rounded
@@ -62,8 +62,10 @@ priority. A future AI adapter should validate its structured output and call:
 baby_tank_face_submit_ai("curious", 70, 3200);
 ```
 
-The controller accepts only the 24 names returned by
-`baby_tank_expression_name()`. It clamps intensity to `20..100`, duration to
+The renderer defines 53 names returned by `baby_tank_expression_name()`.
+General AI replies are further restricted by the cloud emotion whitelist;
+food, game, listening, processing, and other transient states are submitted by
+trusted product flows. The controller clamps intensity to `20..100`, duration to
 `1200..30000 ms`, assigns fixed AI priority, and returns to `calm` when the
 request expires. Touch and safety code use the trusted request API at higher
 priorities. See `docs/bringup/2026-10-16-ai-face-control-contract.md` for the
@@ -74,8 +76,8 @@ full boundary and suggested structured-output schema.
 The provider-independent adapter in `conversation.h/.c` accepts local session
 facts (`listening`, `user_speaking`, `recognizing`, `thinking`, `ai_speaking`,
 `cancelled`, `error`, and `disconnected`) and maps them to trusted face
-requests. Optional model emotion metadata is still restricted to the existing
-24-name whitelist.
+requests. Optional model emotion metadata is still restricted to the cloud
+emotion whitelist.
 
 Speaker PCM should be passed to
 `baby_tank_conversation_observe_tts_pcm16()` immediately before playback. The
@@ -112,10 +114,11 @@ See `docs/bringup/2026-10-16-local-wakenet-plan.md` and
 
 The camera path uses Espressif's `esp32-camera 2.1.8` component with the board's
 confirmed camera pin map. The installed GC2145 produces RGB565 frames, which
-are converted to JPEG in software using two PSRAM frame
-buffers use `CAMERA_GRAB_LATEST`, and the HTTP handler keeps ownership of each
-buffer until its synchronous send completes. This avoids the upstream demo's
-unsafe pattern of returning a camera buffer while an asynchronous send still
+are converted to JPEG in software. The current memory profile uses one PSRAM
+frame buffer with `CAMERA_GRAB_WHEN_EMPTY`; the HTTP handler keeps ownership of
+the buffer until its synchronous send completes. This avoids both corrupted
+rows seen with two continuous buffers under Wi-Fi load and the upstream demo's
+unsafe pattern of returning a buffer while an asynchronous send still
 references it.
 
 - SoftAP SSID: the same `BabyTank-XXXXXX` identity shown over BLE.
@@ -124,13 +127,16 @@ references it.
 - `GET http://192.168.4.1/health`: local camera health.
 - `GET http://192.168.4.1/snapshot.jpg`: one JPEG frame.
 - `GET http://192.168.4.1/stream`: one-client MJPEG stream.
+- `GET http://<station-ip>:8081/stream?token=<boot-token>`: authenticated LAN
+  stream; the IP and token are returned only through encrypted BLE.
 
 The SoftAP is local transport, not a second internet connection. In AP+STA mode
 the robot may still use a provisioned home Wi-Fi network for cloud dialogue,
 while the Android app routes only the video socket over the robot network.
-Camera, Wi-Fi, BLE, audio, and display concurrency is source/build verified but
-not yet measured on physical hardware. Low battery plus camera and Wi-Fi is a
-known brownout risk on this board.
+Basic camera streaming has been observed on physical hardware, but sustained
+frame rate, reconnect behavior, phone compatibility, and low-battery
+concurrency still require regression testing. Low battery plus camera and
+Wi-Fi is a known brownout risk on this board.
 
 ## PCM contract
 

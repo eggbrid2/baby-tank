@@ -5,8 +5,8 @@ Native Android companion app for Baby Tank. The current build targets Android
 
 ## Implemented now
 
-- cute monochrome robot-baby home, pairing, control, hardware-lab, and
-  personality screens;
+- child-oriented home with image-first interaction cards, plus pairing,
+  landscape remote control, hardware lab, volume, and personality screens;
 - runtime BLE permissions and discovery of `BabyTank-XXXX` devices;
 - Espressif Network Provisioning `Security 1` using the personal test device
   secret from ignored `local.properties`;
@@ -24,6 +24,12 @@ Native Android companion app for Baby Tank. The current build targets Android
   grounded load testing;
 - repeated commands while dragging, STOP on release or app backgrounding,
   an emergency-stop button, and head-side 300 ms command expiry.
+- a second-level interaction area with one-button poke reactions, 14 distinct
+  food/drink choices, rock-paper-scissors, a five-second tapping match, and
+  animated dice; the phone provides local animation and sound while the robot
+  receives only semantic actions and final game results;
+- a generated 24-icon soft-clay picture-book atlas for children who cannot yet
+  read. Text remains as a parent/accessibility aid instead of the only cue.
 
 The app never needs the cloud device token. This personal debug build embeds a
 local proof-of-possession value at build time; APK contents can be extracted,
@@ -38,6 +44,11 @@ JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home' \
 ```
 
 Output: `app/build/outputs/apk/debug/app-debug.apk`.
+
+The project currently has no Android unit-test sources. A Gradle
+`testDebugUnitTest` result of `NO-SOURCE` is therefore not evidence of test
+coverage; use device regression for BLE, Wi-Fi routing, controls, camera, and
+the interaction pages.
 
 ## Transport boundary
 

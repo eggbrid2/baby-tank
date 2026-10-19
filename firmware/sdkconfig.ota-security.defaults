@@ -1,0 +1,11 @@
+# Development-safe OTA behavior. Secure Boot and Flash Encryption are enabled
+# only in the controlled production provisioning profile because their eFuses
+# are irreversible.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+CONFIG_BOOTLOADER_APP_SECURE_VERSION=0
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=n
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

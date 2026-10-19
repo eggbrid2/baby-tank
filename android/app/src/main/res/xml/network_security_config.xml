@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The camera's private IPv4 address is assigned by the household DHCP
+         server, so Android cannot enumerate it in a static domain-config.
+         Camera requests are restricted in code to local IPv4 and carry a
+         boot-scoped token delivered over the encrypted BLE session. -->
+    <base-config cleartextTrafficPermitted="true" />
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- The robot SoftAP is local-only and has no DNS name. -->
+        <domain includeSubdomains="false">192.168.4.1</domain>
+    </domain-config>
+</network-security-config>

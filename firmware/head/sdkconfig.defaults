@@ -1,0 +1,73 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Confirmed on the connected device by esptool. Do not reuse for an unknown unit.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHMODE="dio"
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
+
+# The connected package reports 8 MiB embedded octal PSRAM. Start at 80 MHz;
+# a higher clock is not justified until memory stress and power tests pass.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# Keep Wi-Fi, BLE and lwIP static data out of scarce internal SRAM. This is
+# supported by ESP-IDF's built-in extram_bss linker fragments for these stacks.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Large JSON/HTTP allocations should prefer
+# PSRAM, leaving internal blocks for Wi-Fi, DMA and FreeRTOS stacks.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+
+# The first full ASR test left only 5.8 KiB internal heap. Six static RX
+# buffers match the RX BA window; dynamic buffers remain bounded for AP+STA.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# Keep the native USB Serial/JTAG interface available for logs and recovery.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+CONFIG_COMPILER_WARN_WRITE_STRINGS=y
+CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+
+# Product wake word: “喵喵同学”. This packages the fixed WakeNet9 model into
+# the existing model partition; detection is local and does not call cloud ASR.
+CONFIG_SR_WN_WN9_MIAOMIAOTONGXUE_TTS=y
+
+# Official Espressif BLE provisioning with encrypted Security 1 sessions.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
+
+# Prefer external RAM for Wi-Fi/LwIP buffers, leaving scarce internal RAM for
+# camera DMA, the audio feed path, task stacks and TLS's internal-only pieces.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Camera capture runs concurrently with Wi-Fi, BLE and audio tasks. The camera
+# component's IDF 6 default is safer than the older cached 2 KiB value.
+CONFIG_CAMERA_TASK_STACK_SIZE=4096
+# GC2145 RGB565 frames can lose rows with Wi-Fi when DMA writes directly to
+# PSRAM. Stage through a bounded 7.5 KiB internal DMA buffer, then copy each
+# chunk into the single PSRAM frame buffer.
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=8192
+# CONFIG_CAMERA_PSRAM_DMA is not set
+
+# AFE/WakeNet and Wi-Fi consume most internal SRAM. TLS handshakes were
+# failing with PSA_ERROR_INSUFFICIENT_MEMORY (-0x008D) after Internet passed.
+# Keep credentials in protected NVS; this moves transient mbedTLS allocations
+# to the available external RAM. Revisit when flash/PSRAM encryption is enabled.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# The hardware AES DMA path still requires scarce contiguous internal DMA RAM
+# during long ASR uploads; it failed after TLS handshake on the live device.
+# Software AES avoids that second internal-memory bottleneck.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y

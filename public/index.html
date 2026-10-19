@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Baby Tank Cloud</title>
+  <link rel="stylesheet" href="/styles.css?v=20261016-2">
+</head>
+<body>
+  <main id="login" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+      <p class="eyebrow">BABY TANK CLOUD</p>
+      <h1>设备云端控制台</h1>
+      <p class="muted">固件发布、设备状态与 AI 服务配置集中管理。</p>
+      <form id="login-form">
+        <label>用户名<input name="username" autocomplete="username" value="admin" required></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">登录控制台</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+  </main>
+
+  <div id="app" class="app-shell hidden">
+    <aside>
+      <div class="brand"><div class="brand-mark small"><span></span><span></span></div><div><strong>Baby Tank</strong><small>Cloud Console</small></div></div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-page="overview">概览</button>
+        <button class="nav-item" data-page="providers">AI 服务</button>
+        <button class="nav-item" data-page="firmware">固件发布</button>
+        <button class="nav-item" data-page="devices">设备</button>
+        <a class="nav-item" data-page="account" href="/account">账户安全</a>
+      </nav>
+      <button id="logout" class="text-button">退出登录</button>
+    </aside>
+
+    <main class="content">
+      <header><div><p class="eyebrow">PRIVATE CONTROL PLANE</p><h1 id="page-title">系统概览</h1></div><span class="status-pill"><i></i> 服务正常</span></header>
+
+      <section id="page-overview" class="page">
+        <div class="metric-grid">
+          <article class="metric"><span>已登记设备</span><strong id="device-count">0</strong><small>仅设备令牌可访问</small></article>
+          <article class="metric"><span>在线设备</span><strong id="online-count">0</strong><small>最近 5 分钟有心跳</small></article>
+          <article class="metric"><span>固件版本</span><strong id="firmware-count">0</strong><small>包含 stable 与 beta</small></article>
+          <article class="metric"><span>AI 服务</span><strong id="provider-count">0</strong><small>已启用的适配器</small></article>
+        </div>
+        <div class="panel-grid">
+          <article class="panel"><div class="panel-head"><div><p class="eyebrow">DEVICE FLEET</p><h2>最近设备</h2></div></div><div id="recent-devices" class="empty">暂无设备</div></article>
+          <article class="panel safety"><p class="eyebrow">OTA SAFETY</p><h2>安全升级基线</h2><ul><li>A/B 双分区与启动自检</li><li>HTTPS、SHA-256 与签名镜像</li><li>失败回滚与安全版本防降级</li><li>按设备稳定分桶灰度发布</li></ul></article>
+        </div>
+      </section>
+
+      <section id="page-providers" class="page hidden">
+        <div class="notice">密钥仅在服务端加密保存，不会下发到 ESP32。已接入 OpenAI 兼容大模型、阿里 Paraformer ASR 与火山 Seed‑TTS 2.0。</div>
+        <div class="provider-columns">
+          <article class="panel"><p class="eyebrow">LANGUAGE MODEL</p><h2>大模型</h2><div id="llm-list"></div><button class="secondary add-provider" data-kind="llm">添加或更新</button></article>
+          <article class="panel"><p class="eyebrow">SPEECH TO TEXT</p><h2>语音识别</h2><div id="asr-list"></div><button class="secondary add-provider" data-kind="asr">添加或更新</button></article>
+          <article class="panel"><p class="eyebrow">TEXT TO SPEECH</p><h2>语音合成</h2><div id="tts-list"></div><button class="secondary add-provider" data-kind="tts">添加或更新</button></article>
+        </div>
+      </section>
+
+      <section id="page-firmware" class="page hidden">
+        <div class="split">
+          <article class="panel form-panel"><p class="eyebrow">NEW RELEASE</p><h2>上传固件</h2>
+            <form id="firmware-form">
+              <div class="form-row"><label>版本<input name="version" placeholder="1.0.0" required></label><label>板型<input name="board" value="baby-tank-s3" required></label></div>
+              <div class="form-row"><label>通道<select name="channel"><option>stable</option><option>beta</option></select></label><label>安全版本<input name="secureVersion" type="number" min="0" value="0" required></label></div>
+              <div class="form-row"><label>灰度比例<input name="rolloutPercent" type="number" min="1" max="100" value="100" required></label><label>芯片<input name="chip" value="esp32s3" required></label></div>
+              <label>发布说明<input name="notes" maxlength="300"></label>
+              <label class="check"><input name="secureBootRequired" type="checkbox"> 仅允许已启用 Secure Boot 的设备</label>
+              <label>固件文件<input name="file" type="file" accept=".bin,application/octet-stream" required></label>
+              <button type="submit">上传固件</button><p id="firmware-result" class="form-result"></p>
+            </form>
+          </article>
+          <article class="panel"><p class="eyebrow">RELEASES</p><h2>版本列表</h2><div id="firmware-list" class="empty">暂无固件</div></article>
+        </div>
+      </section>
+
+      <section id="page-devices" class="page hidden">
+        <div class="split">
+          <article class="panel form-panel"><p class="eyebrow">ENROLLMENT</p><h2>登记设备</h2><form id="device-form">
+            <label>设备 ID<input name="deviceId" placeholder="tank-001" pattern="[A-Za-z0-9._-]+" required></label>
+            <label>显示名称<input name="name" placeholder="客厅小坦克" required></label>
+            <label>板型<input name="board" value="baby-tank-s3" pattern="[A-Za-z0-9._-]+" required></label>
+            <button type="submit">生成设备令牌</button><p class="muted compact">令牌只显示一次，请通过串口或安全配网写入设备。</p>
+            <pre id="device-token" class="token-box hidden"></pre>
+          </form></article>
+          <article class="panel"><p class="eyebrow">REGISTERED DEVICES</p><h2>设备列表</h2><div id="device-list" class="empty">暂无设备</div></article>
+        </div>
+      </section>
+
+      <section id="page-account" class="page hidden">
+        <div class="account-grid">
+          <article class="panel form-panel"><p class="eyebrow">ACCOUNT SECURITY</p><h2>修改管理员密码</h2>
+            <form id="password-form">
+              <label>当前密码<input name="currentPassword" type="password" autocomplete="current-password" required></label>
+              <label>新密码<input name="newPassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label>
+              <label>确认新密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label>
+              <button type="submit">修改密码</button><p id="password-result" class="form-result" role="status"></p>
+            </form>
+          </article>
+          <article class="panel safety"><p class="eyebrow">SECURITY NOTICE</p><h2>修改后的影响</h2><ul><li>新密码至少 12 位</li><li>修改成功后全部后台会话立即退出</li><li>设备令牌和已保存的 API 凭据不受影响</li></ul></article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="provider-dialog">
+    <form id="provider-form" method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">SERVICE ADAPTER</p><h2>配置服务</h2></div><button class="close" type="button" aria-label="关闭">×</button></div>
+      <input name="kind" type="hidden">
+      <label>供应商<select name="provider" required></select></label>
+      <label>名称<input name="label" required></label>
+      <label>API Base URL<input name="baseUrl" type="url" placeholder="https://api.example.com/v1"></label>
+      <label>模型 / 引擎<select name="modelChoice" required></select></label>
+      <label id="custom-model-field" class="hidden">自定义模型 ID<input name="customModel" placeholder="model-id"></label>
+      <p id="provider-guide" class="notice hidden"></p>
+      <fieldset id="llm-options" class="hidden"><legend>生成与思考</legend><p class="credential-help">思考越强通常越慢、消耗越高；供应商不支持的档位可能返回错误。</p>
+        <label id="llm-dialect-field" class="hidden">中转站兼容协议<select name="llmDialect"><option value="openai">OpenAI</option><option value="qwen">千问</option><option value="deepseek">DeepSeek</option></select></label>
+        <div class="form-row"><label>思考模式<select name="thinkingMode"><option value="default">供应商默认</option><option value="off">关闭</option><option value="on">开启</option></select></label><label>思考强度<select name="reasoningEffort"><option value="">自动</option><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option></select></label></div>
+        <div class="form-row"><label>温度<input name="temperature" type="number" min="0" max="2" step="0.1" placeholder="供应商默认"></label><label>最大输出 Token<input name="maxTokens" type="number" min="1" max="32768" step="1" value="2048"></label></div>
+      </fieldset>
+      <fieldset><legend>供应商凭据</legend><p id="credential-help" class="credential-help">只填写当前供应商要求的字段；留空会保留已保存的值。</p>
+        <label>API Key<input name="apiKey" type="password" autocomplete="off"></label>
+        <div class="form-row"><label id="app-id-field">App ID（旧版）<input name="appId" autocomplete="off"></label><label id="resource-id-field">Resource ID<input name="resourceId" autocomplete="off"></label></div>
+        <div id="secret-fields" class="form-row"><label>Secret ID<input name="secretId" type="password" autocomplete="off"></label><label>Secret Key<input name="secretKey" type="password" autocomplete="off"></label></div>
+        <label id="access-token-field">Access Token（旧版）<input name="accessToken" type="password" autocomplete="off"></label>
+        <label id="workspace-id-field">Workspace ID（阿里百炼，可选）<input name="workspaceId" type="password" autocomplete="off"></label>
+      </fieldset>
+      <fieldset id="audio-options"><legend>音频参数</legend><p class="credential-help">豆包语音的音色 ID 必须属于当前项目并支持 TTS 2.0。</p>
+        <label>音色 ID<input name="speaker" placeholder="zh_female_vv_uranus_bigtts"></label>
+        <div class="form-row"><label>音频格式<select name="audioFormat"><option value="">供应商默认</option><option value="mp3">MP3</option><option value="pcm">PCM 16-bit</option><option value="ogg_opus">Ogg Opus</option></select></label><label>采样率<input name="sampleRate" type="number" min="8000" max="48000" step="50" placeholder="24000"></label></div>
+        <div class="form-row"><label>语速（火山）<input name="speechRate" type="number" min="-50" max="100" value="0"></label><label>音量（火山）<input name="loudnessRate" type="number" min="-50" max="100" value="0"></label></div>
+      </fieldset>
+      <label class="check"><input name="enabled" type="checkbox"> 启用此服务</label>
+      <button type="submit">保存配置</button><p id="provider-result" class="form-result"></p>
+    </form>
+  </dialog>
+  <script type="module" src="/app.js?v=20261016-7"></script>
+</body>
+</html>

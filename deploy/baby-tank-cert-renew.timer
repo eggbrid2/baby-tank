@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Baby Tank IP certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:27:00
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

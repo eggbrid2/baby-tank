@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.tools/
+upstream/
+data/
+artifacts/
+*.log
+node_modules/
+firmware/build/
+firmware/head/build/
+firmware/head/managed_components/
+firmware/head/sdkconfig
+firmware/head/credentials*.bin
+firmware/keys/
+*.pem

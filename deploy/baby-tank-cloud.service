@@ -1,0 +1,23 @@
+[Unit]
+Description=Baby Tank Cloud
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=babytank
+Group=babytank
+WorkingDirectory=/opt/baby-tank-cloud
+EnvironmentFile=/etc/baby-tank-cloud.env
+ExecStart=/usr/bin/node /opt/baby-tank-cloud/src/server.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/baby-tank-cloud
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

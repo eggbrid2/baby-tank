@@ -1,0 +1,9 @@
+services:
+  baby-tank-cloud:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${BABY_TANK_DATA_DIR:-./data}:/data
+    ports:
+      - "127.0.0.1:8787:8787"

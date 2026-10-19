@@ -1,0 +1,20 @@
+{
+  "name": "baby-tank-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "NODE_ENV=development node --watch src/server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/server.mjs && node --check src/adapters.mjs && node --check public/app.js"
+  },
+  "dependencies": {
+    "@iconify-json/fluent-emoji-flat": "^1.2.6",
+    "sharp": "^0.35.5",
+    "ws": "^8.18.3"
+  }
+}

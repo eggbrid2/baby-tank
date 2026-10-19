@@ -1,12 +1,34 @@
-# Baby Tank
+<div align="center">
+  <img src="docs/assets/baby-tank-face-hero.png" width="420" alt="Baby Tank smiling face">
+  <h1>Baby Tank</h1>
+  <p><strong>一个会说话、会表达、会开车，也会犯困的机器人宝宝。</strong></p>
+  <p>
+    <img src="https://img.shields.io/badge/Firmware-ESP--IDF_6.1-00cfc5?style=flat-square" alt="Firmware: ESP-IDF 6.1">
+    <img src="https://img.shields.io/badge/Android-Kotlin_%2B_Compose-7f52ff?style=flat-square" alt="Android: Kotlin and Compose">
+    <img src="https://img.shields.io/badge/Cloud-Node.js_24-339933?style=flat-square" alt="Cloud: Node.js 24">
+    <img src="https://img.shields.io/badge/Stage-Hardware_Bring--up-f2a65a?style=flat-square" alt="Stage: hardware bring-up">
+  </p>
+  <p>
+    <a href="#玩法">玩法</a> ·
+    <a href="#系统架构">架构</a> ·
+    <a href="#项目分类">项目分类</a> ·
+    <a href="#快速开始">快速开始</a> ·
+    <a href="docs/README.md">完整文档</a>
+  </p>
+</div>
 
-Baby Tank 是一个面向儿童的可移动桌面宠物：它有自己的表情、心情和作息，可以通过语音、触摸和手机互动，也能观察环境、控制履带底盘并玩小游戏。
+Baby Tank 是一个面向儿童的可移动桌面宠物。它有自己的表情、心情和作息，可以通过语音、触摸和手机互动，也能观察环境、控制履带底盘并玩小游戏。
 
 这不是给 ESP-SparkBot 示例换皮。项目只参考其硬件资料、引脚和底盘协议，正式固件、Android App、云端编排、角色状态和视觉系统均在本仓库重新实现。
 
-> 当前阶段：功能集成与实机验证。它还不是经过儿童安全、续航、跌落、EMC、隐私和量产安全认证的成品。
+> [!IMPORTANT]
+> 当前处于功能集成与实机验证阶段，还不是经过儿童安全、续航、跌落、EMC、隐私和量产安全认证的成品。
 
-![Baby Tank 儿童交互视觉资产](android/design-assets/interaction_atlas_preview.png)
+## 项目速览
+
+| 有生命感的屏幕 | 自然的 AI 对话 | 可移动、可观察 | 孩子看图就能玩 |
+| --- | --- | --- | --- |
+| 53 种表达状态，慢心情、短情绪、正常/无聊/睡觉三态 | 本地唤醒，云端 ASR/LLM/TTS，表情与语音同步 | BLE 遥控、AI 动作组、SoftAP/LAN 摄像头 | 喂食、戳一戳、石头剪刀布、连点比赛、摇骰子 |
 
 ## 产品定位
 
@@ -125,6 +147,12 @@ BLE 只下发动作结果，不传动画帧；摇骰子等过程由两端根据�
 
 ## 玩法
 
+<p align="center">
+  <img src="android/design-assets/interaction_atlas_preview.png" width="720" alt="Baby Tank interaction art for games, food and drinks">
+</p>
+
+手机端以图形作为主要操作线索。上图是当前游戏、食物、饮品和胜负反馈的统一软陶绘本风资产；文字只作为家长和无障碍辅助。
+
 ### 陪伴与对话
 
 - 说“喵喵同学”或触摸顶部开始对话。
@@ -176,6 +204,19 @@ BLE 只下发动作结果，不传动画帧；摇骰子等过程由两端根据�
 | 摄像头 | 固件流与 App 客户端已实现 | 不同手机/网络组合下的帧率、延迟和重连稳定性 |
 
 “源码存在”或“构建通过”不等于整机验收通过。每项实机结论和遗留问题记录在 [`docs/bringup/`](docs/bringup/) 中。
+
+## 路线图
+
+- [x] 独立 ESP32-S3 固件、屏幕和基础角色形象
+- [x] WakeNet、触摸唤醒、流式 PCM 对话和语音驱动嘴形
+- [x] BLE 配网与控制、UART 底盘桥接、遥控租约和急停抢占
+- [x] 心情系统、正常/无聊/睡觉状态和梦境动画
+- [x] Android 横屏遥控、摄像头、喂食和三种小游戏
+- [ ] Android 真机视觉回归与自动化界面测试
+- [ ] 摄像头在不同手机和网络下的帧率、延迟与重连基准
+- [ ] 底盘直行标定、满速负载和独立失联停车验证
+- [ ] Secure Boot、Flash/NVS Encryption 和正式密钥轮换
+- [ ] 儿童使用场景的机械、电池、隐私和家长控制验收
 
 ## 快速开始
 
@@ -241,3 +282,9 @@ idf.py -C firmware/head build
 - 儿童使用前仍需完成运动限力、夹手、跌落、电池、隐私、误唤醒和家长控制评估。
 
 上游 ESP-SparkBot 只作为硬件与行为参考，不随本仓库分发。第三方代码、图片、声音、字体和模型各自适用独立许可；详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+## 协作与许可
+
+提交代码前先阅读 [`agent-readme.md`](agent-readme.md)，并在对应的 `docs/bringup/` 记录事实、测试证据、风险和未验证项。云端改动至少运行 `npm test` 与 `npm run check`；Android 和固件改动分别完成对应构建，涉及硬件行为时不能用模拟结果代替实机记录。
+
+仓库目前尚未选择根 `LICENSE`。因此“GitHub 公开可读”不等于已经授予复制、修改、分发或商业使用权，也不能暂时标注 MIT、Apache-2.0 等徽章。准备正式开放外部贡献或发布前，需要先确定本项目许可证，并完成第三方素材与依赖的逐项许可复核。

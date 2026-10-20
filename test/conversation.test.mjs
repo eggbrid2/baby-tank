@@ -75,6 +75,9 @@ test('conversation parser keeps model action proposals strictly bounded', () => 
 
 test('AI drawing accepts only layouts backed by bundled designer SVG assets', () => {
   assert.equal(explicitDrawIntent('画辆自行车'), true);
+  assert.equal(explicitDrawIntent('画画吧'), true);
+  assert.equal(explicitDrawIntent('给我画一幅画'), true);
+  assert.equal(explicitDrawIntent('你会画画吗'), false);
   assert.equal(explicitDrawIntent('不要画小汽车'), false);
   const items = [{ emoji: '🐈', x: 98, y: 126, size: 150, rotation: 0, flipX: false },
     { emoji: '🧶', x: 190, y: 158, size: 62, rotation: 0, flipX: false }];
@@ -99,6 +102,8 @@ test('explicit drive grammar stays narrow as the deterministic fallback', () => 
     ['向前走一步', 'forward', null], ['请你后退一下', 'backward', null],
     ['喵喵同学左转一下', 'left', null], ['坦克向右转', 'right', null],
     ['前进3秒', 'forward', 3000], ['向右转2.5秒', 'right', 2500],
+    ['向前走两秒', 'forward', 2000], ['后退三秒吧', 'backward', 3000],
+    ['左转一下吧', 'left', null],
     ['让你往后走一点', 'backward', null],
   ]) assert.deepEqual(explicitDriveIntent(utterance), { direction, durationMs });
   for (const utterance of ['为什么不能前进？', '不要向前走', '如果向前走会怎样',

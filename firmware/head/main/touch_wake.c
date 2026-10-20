@@ -14,7 +14,7 @@
 #define TOUCH_WAKE_INITIAL_SCANS 3
 #define TOUCH_WAKE_SCAN_TIMEOUT_MS 2000
 #define TOUCH_WAKE_DEBOUNCE_MS 1200
-#define TOUCH_TOP_CONFIRM_MS 80
+#define TOUCH_TOP_CONFIRM_MS 120
 #define TOUCH_SIDE_CONFIRM_MS 120
 #define TOUCH_SIDE_SECOND_SAMPLE_MS 60
 #define TOUCH_SIDE_MIN_DELTA_PER_MILLE 100U
@@ -30,7 +30,11 @@ typedef struct {
 
 static const touch_zone_config_t TOUCH_ZONES[TOUCH_WAKE_CHANNEL_COUNT] = {
     {.channel_id = 1, .zone = BABY_TANK_TOUCH_TOP,
-     .threshold_per_mille = 25U, .name = "top"},
+     /* 25 per mille produced a measured 42 per mille false edge while the
+      * dialogue microphone was active, immediately cancelling the turn.
+      * The vendor BSP uses 40; keep additional margin for chassis/audio
+      * coupling and require a sustained edge below. */
+     .threshold_per_mille = 50U, .name = "top"},
     {.channel_id = 2, .zone = BABY_TANK_TOUCH_LEFT,
      .threshold_per_mille = 100U, .name = "left"},
     {.channel_id = 3, .zone = BABY_TANK_TOUCH_RIGHT,

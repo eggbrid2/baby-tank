@@ -66,8 +66,16 @@ export function explicitLookIntent(text) {
 export function explicitDrawIntent(text) {
   if (typeof text !== 'string') return false;
   const normalized = text.trim().replace(/[\s，。！？!?,.]+/gu, '');
-  return !/(?:不要|别|不用|不许)(?:画|绘制)/u.test(normalized) &&
-    /(?:画(?:一|个|只|辆|张|幅|点|出|画)?|绘制)(?:个|一|只|辆|张|幅)?[\p{Script=Han}A-Za-z]{1,24}/u.test(normalized);
+  if (/(?:不要|别|不用|不许)(?:画|绘制)/u.test(normalized)) return false;
+  if (/^(?:喵喵同学)?(?:你)?(?:(?:会|能|可以)画画|会不会画画)(?:吗|么)?$/u
+    .test(normalized)) return false;
+  /* "画画吧" is a complete child-facing request even without a named
+   * subject. Keep capability questions such as "你会画画吗" out of the
+   * action path so a question never starts an unsolicited drawing. */
+  if (/^(?:喵喵同学)?(?:请|帮我|给我|你来|来)?(?:画画|画一幅画|画张画)(?:吧|好吗|好不好)?$/u
+    .test(normalized)) return true;
+  return /(?:画(?:一|个|只|辆|张|幅|点|出|画)?|绘制)(?:个|一|只|辆|张|幅)?[\p{Script=Han}A-Za-z]{1,24}/u
+    .test(normalized);
 }
 
 export function drawingMessages(userText) {
@@ -152,9 +160,12 @@ function parseActionProposal(structured) {
 export function explicitDriveIntent(text) {
   if (typeof text !== 'string') return null;
   const normalized = text.trim().replace(/[\s，。！？!？,]+/g, '').replace(/\.$/, '');
-  const match = /^(?:喵喵同学)?(?:请|帮我|麻烦你|让你)?(?:小车|坦克|你)?(向前|往前|前进|向后|往后|后退|向左|往左|左转|向右|往右|右转)(?:走|开|移动|转)?(?:(?:持续)?([1-9](?:\.\d)?)秒|一下|一步|一点|吧)?$/.exec(normalized);
+  const match = /^(?:喵喵同学)?(?:请|帮我|麻烦你|让你)?(?:小车|坦克|你)?(向前|往前|前进|向后|往后|后退|向左|往左|左转|向右|往右|右转)(?:走|开|移动|转)?(?:(?:持续)?([1-9](?:\.\d)?|[一二两三四五六七八九])秒|一下|一步|一点)?(?:吧|好吗|好不好)?$/.exec(normalized);
   if (!match) return null;
-  const durationMs = match[2] ? Math.round(Number(match[2]) * 1000) : null;
+  const chineseSeconds = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5,
+    六: 6, 七: 7, 八: 8, 九: 9 };
+  const seconds = match[2] ? (chineseSeconds[match[2]] ?? Number(match[2])) : null;
+  const durationMs = seconds === null ? null : Math.round(seconds * 1000);
   if (durationMs !== null && (durationMs < 2000 || durationMs > 9000)) return null;
   const direction = ['向前', '往前', '前进'].includes(match[1]) ? 'forward'
     : ['向后', '往后', '后退'].includes(match[1]) ? 'backward'

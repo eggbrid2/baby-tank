@@ -38,10 +38,23 @@
 - 主卡圆角 28–32 dp，普通卡 23–26 dp，横向页边距统一为 20 dp。
 - 食物和游戏卡内图片改为按剩余空间自适应 `Fit`，不再依赖固定 92 dp 尺寸挤压三列布局。
 
+## 图像化图标系统
+
+旧版 Android 桌面图标是 `drawable/ic_launcher.xml` 中手写的三组路径，首页对话、驾驶和设置入口也混用了 Compose `Canvas` 线条图标。这种方案适合占位和系统级小图标，不适合作为儿童产品的品牌主视觉。
+
+本轮使用内置图像生成工具，以现有软陶游戏手柄素材作为材质与配色参考，分别生成并人工检查四张独立图片，没有再次使用容易串格的整页图集：
+
+- `ic_launcher.png`：蜜桃奶油色软陶底座上的宝宝屏幕脸，作为 Android 桌面图标。
+- `icon_home_talk.png`：带宝宝脸和声波的软陶对话泡泡。
+- `icon_home_drive.png`：四轮软陶宝宝小车，表示开车。
+- `icon_parent_settings.png`：奶油色软陶齿轮，表示家长设置。
+
+生成约束统一为：透明背景（桌面图标除外）、主体完整、留出安全边距、无文字、无边框、无水印、避免扁平矢量和线框图。项目资源统一归一化到 512×512 PNG；界面通过 `Image` 和 `ContentScale.Fit` 展示，不再在运行时绘制儿童首页主图标。
+
 ## 验证边界
 
-- Android `0.2.1`（versionCode 9）的 `assembleDebug`、`lintDebug` 和 3 个导航单元测试均通过；APK SHA-256 为 `9886f816ac82e8dc7b7edc77f56628140856fd44a69b5bde23b0e095206500fd`。
-- APK 已通过 USB 覆盖安装，`dumpsys package` 确认手机端版本为 0.2.1。
+- Android `0.2.2`（versionCode 10）的 `assembleDebug`、`lintDebug` 和 3 个导航单元测试均通过；APK SHA-256 为 `5e00bf13ba58ef931cb59ac1358d74351c28e2f28685eb283cf6d59760609321`。
+- APK 已通过 USB 覆盖安装，`dumpsys package` 确认手机端版本为 0.2.2。
 - Lint 仍报告依赖可升级、备用配网页面启用 JavaScript、局域网 HTTP 明文白名单和少量 Kotlin 优化建议；它们不是本轮 UI 重构引入的编译错误，但安全项需要在配网链路收敛时单独处理。
 - 系统返回层级由 `BackHandler` 明确处理，但最终手感、不同屏幕尺寸和横竖屏切换仍需要真机解锁后的人工回归。
 - 遥控页保持现有横屏布局，本轮没有重写控制协议和视频链路。

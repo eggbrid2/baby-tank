@@ -352,11 +352,18 @@ private fun HomeScreen(
     item {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("BABY TANK", fontSize = 11.sp, letterSpacing = 2.sp, color = CyanDeep, fontWeight = FontWeight.Black)
-                Text("和喵喵一起玩", fontSize = 27.sp, fontWeight = FontWeight.Black, color = Ink)
+                Text(
+                    "BABY TANK",
+                    fontSize = 10.sp,
+                    letterSpacing = 2.4.sp,
+                    color = CyanDeep,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text("今天也一起玩吧", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink)
             }
             Card(
-                modifier = Modifier.size(44.dp).clickable(onClick = onSettings),
+                modifier = Modifier.size(42.dp).clickable(onClick = onSettings),
                 shape = CircleShape,
                 colors = CardDefaults.cardColors(containerColor = Paper),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Line),
@@ -365,7 +372,7 @@ private fun HomeScreen(
                     Image(
                         painter = painterResource(R.drawable.icon_parent_settings),
                         contentDescription = "家长设置",
-                        modifier = Modifier.size(36.dp),
+                        modifier = Modifier.size(30.dp),
                         contentScale = ContentScale.Fit,
                     )
                 }
@@ -374,44 +381,57 @@ private fun HomeScreen(
     }
     item {
         Card(
-            shape = RoundedCornerShape(36.dp),
-            colors = CardDefaults.cardColors(containerColor = PeachWash),
-            modifier = Modifier.fillMaxWidth().clickable(
+            shape = RoundedCornerShape(32.dp),
+            colors = CardDefaults.cardColors(containerColor = Ink),
+            modifier = Modifier.fillMaxWidth().height(292.dp).clickable(
                 onClick = if (connected) onTalk else onConnect,
             ),
         ) {
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 17.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                Modifier.fillMaxSize().padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 16.dp),
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("点点我", color = Ink, fontSize = 19.sp, fontWeight = FontWeight.Black)
-                        Text(
-                            if (connected) "我会听你说话" else "请爸爸妈妈先连接",
-                            color = SoftInk,
-                            fontSize = 12.sp,
-                        )
-                    }
                     Box(
-                        Modifier.size(38.dp).background(Paper.copy(.78f), CircleShape),
+                        Modifier.size(7.dp).background(
+                            if (connected) Color(0xFF70DCA0) else Color.White.copy(alpha = .35f),
+                            CircleShape,
+                        ),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        if (connected) "喵喵在这里" else "等待连接",
+                        color = Color.White.copy(alpha = .72f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Box(
+                        Modifier.size(34.dp).background(Color.White.copy(alpha = .08f), CircleShape),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Image(
-                            painter = painterResource(R.drawable.icon_home_talk),
-                            contentDescription = null,
-                            modifier = Modifier.size(31.dp),
-                            contentScale = ContentScale.Fit,
-                        )
+                        MiniGlyph(GlyphKind.Dialogue, true, Modifier.size(18.dp), tint = Cyan)
                     }
                 }
-                Image(
-                    painter = painterResource(R.drawable.icon_home_talk),
-                    contentDescription = "和喵喵说话",
-                    modifier = Modifier.fillMaxWidth(.88f).height(170.dp),
-                    contentScale = ContentScale.Fit,
+                BabyFace(
+                    Modifier.fillMaxWidth().weight(1f).padding(horizontal = 12.dp, vertical = 5.dp),
+                    connected = connected,
                 )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (connected) "和我说说话" else "先认识一下吧",
+                            color = Color.White,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            if (connected) "轻轻点我，就会认真听" else "连接后，我就能陪你玩",
+                            color = Color.White.copy(alpha = .52f),
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Text("→", color = Cyan, fontSize = 22.sp, fontWeight = FontWeight.Light)
+                }
             }
         }
     }
@@ -420,28 +440,21 @@ private fun HomeScreen(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ChildActionCard(
-                title = "开车",
+            HomeActionCard(
+                title = "遥控",
+                subtitle = "一起出发",
                 color = SkyWash,
+                drawable = R.drawable.icon_home_drive_v2,
                 modifier = Modifier.weight(1f),
                 onClick = if (connected) onDrive else onConnect,
-                illustration = {
-                    Image(
-                        painter = painterResource(R.drawable.icon_home_drive),
-                        contentDescription = "开车",
-                        modifier = Modifier.size(118.dp),
-                        contentScale = ContentScale.Fit,
-                    )
-                },
             )
-            ChildActionCard(
-                title = "一起玩",
+            HomeActionCard(
+                title = "互动",
+                subtitle = "玩点什么",
                 color = ButterWash,
+                drawable = R.drawable.icon_home_play_v2,
                 modifier = Modifier.weight(1f),
                 onClick = if (connected) onPlay else onConnect,
-                illustration = {
-                    InteractionArtIcon(InteractionArt.Games, Ink, Modifier.size(112.dp))
-                },
             )
         }
     }
@@ -1416,30 +1429,31 @@ private fun SettingsRow(
 }
 
 @Composable
-private fun ChildActionCard(
+private fun HomeActionCard(
     title: String,
+    subtitle: String,
     color: Color,
+    drawable: Int,
     modifier: Modifier,
     onClick: () -> Unit,
-    illustration: @Composable () -> Unit,
 ) {
     Card(
-        modifier = modifier.height(184.dp).clickable(onClick = onClick),
-        shape = RoundedCornerShape(30.dp),
+        modifier = modifier.height(172.dp).clickable(onClick = onClick),
+        shape = RoundedCornerShape(26.dp),
         colors = CardDefaults.cardColors(containerColor = color),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Line.copy(alpha = .55f)),
     ) {
-        Column(
-            Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 13.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            Box(
-                Modifier.fillMaxWidth().weight(1f),
-                contentAlignment = Alignment.Center,
-            ) {
-                illustration()
+        Box(Modifier.fillMaxSize()) {
+            Image(
+                painter = painterResource(drawable),
+                contentDescription = title,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 6.dp).size(104.dp),
+                contentScale = ContentScale.Fit,
+            )
+            Column(Modifier.align(Alignment.BottomStart).padding(16.dp)) {
+                Text(title, fontWeight = FontWeight.Bold, fontSize = 19.sp, color = Ink)
+                Text(subtitle, fontWeight = FontWeight.Medium, fontSize = 11.sp, color = SoftInk.copy(alpha = .72f))
             }
-            Text(title, fontWeight = FontWeight.Black, fontSize = 21.sp, color = Ink)
         }
     }
 }

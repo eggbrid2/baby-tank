@@ -24,8 +24,8 @@ android {
         applicationId = "com.babytank.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.2.2"
+        versionCode = 11
+        versionName = "0.2.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "BABY_TANK_SETUP_POP", "\"$babyTankSetupPop\"")

@@ -22,11 +22,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.cos
 import kotlin.math.sin
 
 @Composable
@@ -40,61 +43,143 @@ fun BabyFace(
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
             keyframes {
-                durationMillis = 4200
+                durationMillis = 6800
                 1f at 0
-                1f at 3180
-                0.08f at 3260
-                1f at 3400
-                1f at 4200
+                1f at 3300
+                0.06f at 3390
+                1f at 3520
+                1f at 3740
+                0.12f at 3820
+                1f at 3940
+                1f at 6800
             },
         ),
         label = "blink",
+    )
+    val gazeX by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            keyframes {
+                durationMillis = 9200
+                0f at 0
+                0f at 900
+                -0.58f at 1750
+                -0.58f at 3100
+                0.42f at 4400
+                0.42f at 6250
+                0f at 7420
+                0f at 9200
+            },
+        ),
+        label = "gaze-x",
+    )
+    val gazeY by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            keyframes {
+                durationMillis = 10400
+                0f at 0
+                -0.18f at 2400
+                -0.18f at 4300
+                0.12f at 6200
+                0.12f at 8200
+                0f at 10400
+            },
+        ),
+        label = "gaze-y",
     )
     val time by transition.animateFloat(
         initialValue = 0f,
         targetValue = 6.28318f,
         animationSpec = infiniteRepeatable(
             animation = keyframes {
-                durationMillis = 3600
-                6.28318f at 3600 using LinearEasing
+                durationMillis = 4800
+                6.28318f at 4800 using LinearEasing
             },
         ),
-        label = "float",
+        label = "breathing",
     )
 
     Canvas(modifier = modifier) {
+        val radius = size.minDimension * 0.17f
         drawRoundRect(
-            color = Ink,
-            cornerRadius = CornerRadius(size.minDimension * 0.16f),
+            brush = Brush.verticalGradient(
+                listOf(Color(0xFF20272A), Color(0xFF111416)),
+            ),
+            cornerRadius = CornerRadius(radius),
         )
-        val floatY = sin(time) * size.height * 0.012f
-        val eyeWidth = size.width * 0.17f
-        val eyeHeight = size.height * 0.27f * blink
-        val eyeY = size.height * 0.37f + floatY - eyeHeight / 2f
-        listOf(size.width * 0.31f, size.width * 0.69f).forEach { centerX ->
+        drawRoundRect(
+            color = Color.White.copy(alpha = .08f),
+            cornerRadius = CornerRadius(radius),
+            style = Stroke(width = 1.2.dp.toPx()),
+        )
+        drawArc(
+            color = Color.White.copy(alpha = .055f),
+            startAngle = 196f,
+            sweepAngle = 118f,
+            useCenter = false,
+            topLeft = Offset(size.width * .05f, size.height * .04f),
+            size = Size(size.width * .9f, size.height * .82f),
+            style = Stroke(width = size.minDimension * .012f, cap = StrokeCap.Round),
+        )
+
+        val breathY = sin(time) * size.height * 0.009f
+        val swayX = cos(time) * size.width * 0.003f
+        val eyeWidth = size.minDimension * 0.15f
+        val eyeHeight = size.minDimension * 0.255f * blink
+        val gazeOffsetX = gazeX * size.width * .032f + swayX
+        val gazeOffsetY = gazeY * size.height * .04f + breathY
+        val eyeY = size.height * 0.42f + gazeOffsetY - eyeHeight / 2f
+        val eyeColor = if (connected) Cyan else Color(0xFF78AAA8)
+
+        listOf(size.width * 0.34f, size.width * 0.66f).forEach { baseX ->
+            val centerX = baseX + gazeOffsetX
+            drawCircle(
+                color = eyeColor.copy(alpha = .07f * blink),
+                radius = eyeWidth * 1.05f,
+                center = Offset(centerX, size.height * .42f + gazeOffsetY),
+            )
             drawRoundRect(
-                color = if (connected) Cyan else Cyan.copy(alpha = 0.82f),
+                brush = Brush.verticalGradient(
+                    listOf(eyeColor.copy(alpha = .96f), eyeColor.copy(alpha = .76f)),
+                    startY = eyeY,
+                    endY = eyeY + eyeHeight.coerceAtLeast(3f),
+                ),
                 topLeft = Offset(centerX - eyeWidth / 2f, eyeY),
                 size = Size(eyeWidth, eyeHeight.coerceAtLeast(3f)),
                 cornerRadius = CornerRadius(eyeWidth / 2f),
             )
+            if (blink > .45f) {
+                drawRoundRect(
+                    color = Color.White.copy(alpha = .62f),
+                    topLeft = Offset(
+                        centerX - eyeWidth * .22f,
+                        eyeY + eyeHeight * .16f,
+                    ),
+                    size = Size(eyeWidth * .18f, eyeHeight * .19f),
+                    cornerRadius = CornerRadius(eyeWidth * .1f),
+                )
+            }
         }
-        val mouthWidth = size.width * 0.18f
-        val mouthHeight = size.height * 0.055f
-        drawRoundRect(
+
+        val mouthWidth = size.minDimension * .2f
+        val mouthHeight = size.minDimension * .095f
+        drawArc(
             color = Cream,
-            topLeft = Offset(
-                size.width / 2f - mouthWidth / 2f,
-                size.height * 0.64f + floatY,
-            ),
+            startAngle = 18f,
+            sweepAngle = 144f,
+            useCenter = false,
+            topLeft = Offset(size.width / 2f - mouthWidth / 2f, size.height * .59f + breathY),
             size = Size(mouthWidth, mouthHeight),
-            cornerRadius = CornerRadius(mouthHeight / 2f),
+            style = Stroke(width = size.minDimension * .022f, cap = StrokeCap.Round),
         )
         if (connected) {
             drawCircle(
                 color = Color(0xFF72F2A9),
-                radius = size.minDimension * 0.025f,
-                center = Offset(size.width * 0.88f, size.height * 0.13f),
+                radius = size.minDimension * 0.018f,
+                center = Offset(size.width * 0.9f, size.height * 0.14f),
             )
         }
     }

@@ -74,6 +74,8 @@ test('conversation parser keeps model action proposals strictly bounded', () => 
 });
 
 test('AI drawing accepts only layouts backed by bundled designer SVG assets', () => {
+  assert.match(conversationMessages('讲个故事', [], {})[0].content,
+    /即使孩子没有直接命令画画/);
   assert.equal(explicitDrawIntent('画辆自行车'), true);
   assert.equal(explicitDrawIntent('画画吧'), true);
   assert.equal(explicitDrawIntent('给我画一幅画'), true);
@@ -95,6 +97,17 @@ test('AI drawing accepts only layouts backed by bundled designer SVG assets', ()
   assert.equal(parseConversationReply(JSON.stringify({ reply: '画好了',
     drawing: { durationMs: 6000, items } })).drawing, null,
   'the dialogue model cannot bypass the dedicated curated renderer');
+  assert.deepEqual(parseConversationReply(JSON.stringify({ reply: '我想到一幅小画。',
+    drawing: { subject: '一只追毛线的小猫' }, action: null, camera: null })).drawing,
+  { subject: '一只追毛线的小猫' });
+  for (const drawing of [
+    { subject: 'https://example.com/cat' },
+    { subject: '<svg>cat</svg>' },
+    { subject: '这是一个超过二十四个字符而且不应该进入绘图器的复杂画面描述字符串' },
+    { subject: '小猫', extra: true },
+    '小猫',
+  ]) assert.equal(parseConversationReply(JSON.stringify({ reply: '看看这个', drawing })).drawing,
+    null);
 });
 
 test('explicit drive grammar stays narrow as the deterministic fallback', () => {

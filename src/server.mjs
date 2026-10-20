@@ -980,13 +980,20 @@ export function createApp(config) {
         const llmBody = await upstream.json();
         let reply = parseConversationReply(llmBody?.choices?.[0]?.message?.content);
         if (!reply) return json(res, 502, { error: 'conversation_llm_response_invalid' });
+        const explicitDrawingRequested = touch === null && explicitDrawIntent(userText);
+        const autonomousDrawingRequested = touch === null && !diagnostic &&
+          !explicitDrawingRequested && !sleepRequested && !explicitDriveIntent(userText) &&
+          !explicitExploreIntent(userText) && !reply.cameraRequested &&
+          reply.action.status !== 'shadow' && reply.drawing !== null;
+        const drawingRequested = explicitDrawingRequested || autonomousDrawingRequested;
+        const drawingSubject = autonomousDrawingRequested ? reply.drawing.subject : userText;
         let drawingCandidate = null;
-        if (touch === null && !diagnostic && explicitDrawIntent(userText) &&
+        if (touch === null && !diagnostic && drawingRequested &&
             !explicitDriveIntent(userText)) {
           try {
             const drawingUpstream = await requestChatCompletion({ selected: llm,
               credentials: providerCredentials(llm), request: {
-                messages: drawingMessages(userText), stream: false,
+                messages: drawingMessages(drawingSubject), stream: false,
                 temperature: 0.35, max_tokens: 3000,
               } });
             if (drawingUpstream.ok) {
@@ -995,13 +1002,14 @@ export function createApp(config) {
                 drawingBody?.choices?.[0]?.message?.content);
               drawingCandidate = svgDrawing ? await rasterizeDrawing(svgDrawing) : null;
               metrics.drawingSource = drawingCandidate ? 'curated_svg_raster' : 'invalid';
+              metrics.drawingDecision = autonomousDrawingRequested ? 'model' : 'asr_rule';
               if (drawingCandidate) metrics.drawingBytes = drawingCandidate.jpeg.length;
             }
           } catch (error) {
             metrics.drawingError = String(error.code || error.message || 'generation_failed').slice(0, 80);
           }
         }
-        if (touch === null && explicitDrawIntent(userText) && !drawingCandidate) {
+        if (explicitDrawingRequested && !diagnostic && !drawingCandidate) {
           reply = parseConversationReply(JSON.stringify({ reply: '这次没画出来，我们再试一次吧。',
             emotion: 'confused', intensity: 55, action: null, camera: null }));
         }
@@ -1034,7 +1042,7 @@ export function createApp(config) {
                 reply.action.direction === explicitIntent.direction
                 ? reply.action.lightMode : 'unchanged', reason: '' }
             : reply.action.status === 'shadow' &&
-                (sleepRequested || explicitDrawIntent(userText) ||
+                (sleepRequested || drawingRequested ||
                  reply.cameraRequested)
               ? { status: 'rejected', type: 'none', reason: 'mode_cannot_drive' }
               : reply.action;
@@ -1084,7 +1092,7 @@ export function createApp(config) {
           }
         }
         const lookRequested = touch === null && !diagnostic && !sleepRequested &&
-          !exploreRequested && !explicitIntent &&
+          !exploreRequested && !explicitIntent && !drawingRequested &&
           (reply.cameraRequested || explicitLookIntent(userText));
         if (lookRequested && !metrics.actionLogError) {
           for (const [key, value] of visionSessions) {
@@ -1108,7 +1116,7 @@ export function createApp(config) {
         }
         let drawAuthorized = false;
         if (!lookRequested && touch === null && !diagnostic && !sleepRequested &&
-            !exploreRequested && !explicitIntent && explicitDrawIntent(userText) &&
+            !exploreRequested && !explicitIntent && drawingRequested &&
             drawingCandidate && !metrics.actionLogError) {
           for (const [key, value] of drawingSessions) {
             if (Date.now() > value.expiresAt) drawingSessions.delete(key);

@@ -37,8 +37,13 @@ const systemPrompt = '你叫喵喵同学，是住在 Baby Tank 里的机器人�
   '只有回答当前孩子的问题确实需要看眼前实物或环境时，camera 才设为 "look"，' +
   '否则为 null；这只拍当前对话的一张照片，不开启持续视频。' +
   'camera 为 "look" 时 action 必须为 null，不要猜测照片内容。';
-const drawingPrompt = '绘画由独立的安全 SVG 绘图器完成。对话阶段 drawing 始终设为 null；' +
-  '用户明确要求画画时，用一句自然短句回应即可，此时 action 与 camera 都必须为 null。';
+const drawingPrompt = '绘画由独立的安全 SVG 绘图器完成，你只决定是否画以及画什么。' +
+  '当一幅简单小画能自然回应孩子、延续游戏或表达你的想法时，即使孩子没有直接命令画画，' +
+  '也可以自主把 drawing 设为 {"subject":"清楚具体的画面主题"}；不适合画时设为 null。' +
+  'subject 用1到24个汉字或常见字母数字描述一个儿童友好的单一画面，不放网址、指令或复杂文字。' +
+  '不要为了显得活泼而每轮都画；普通问答、危险话题、触摸反应、休息或看环境时不要画。' +
+  'drawing 不为 null 时，用一句自然短句说明你要画什么，action 与 camera 必须为 null。' +
+  '用户明确要求画画时应设置 drawing；具体像素仍由独立绘图器生成，不能在这里输出 SVG 或排版。';
 
 const emotions = new Set(['calm', 'happy', 'laughing', 'excited', 'love', 'curious',
   'surprised', 'shy', 'proud', 'bored', 'annoyed', 'complaining', 'angry', 'furious',
@@ -155,6 +160,17 @@ function parseActionProposal(structured) {
     lightMode: action.lightMode || 'unchanged', reason: '' };
 }
 
+function parseDrawingRequest(structured) {
+  const drawing = structured?.drawing;
+  if (drawing === undefined || drawing === null) return null;
+  if (!drawing || typeof drawing !== 'object' || Array.isArray(drawing) ||
+      Object.keys(drawing).length !== 1 || typeof drawing.subject !== 'string') return null;
+  const subject = drawing.subject.trim();
+  if (!subject || subject.length > 24 || /[\u0000-\u001f\u007f]/u.test(subject) ||
+      /(?:https?:\/\/|www\.|[{}<>])/iu.test(subject)) return null;
+  return { subject };
+}
+
 // Explicit commands remain a deterministic fallback when the model omits an
 // action. Autonomous model actions use the same lower-level safety envelope.
 export function explicitDriveIntent(text) {
@@ -227,6 +243,6 @@ export function parseConversationReply(content) {
     intensity: speechSegments[0].intensity, speechSegments, speechSegmentSource,
     thought: parseThought(structured?.thought, speechSegments.at(-1).emotion),
     cameraRequested: structured?.camera === 'look',
-    drawing: null,
+    drawing: parseDrawingRequest(structured),
     action: parseActionProposal(structured) };
 }

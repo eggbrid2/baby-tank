@@ -486,6 +486,23 @@ test('admin, provider, device and safe OTA flow', async (t) => {
     { headers: deviceHeaders });
   assert.equal(focusedScene.headers.get('content-type'), 'image/jpeg');
   assert.ok((await focusedScene.arrayBuffer()).byteLength > 256);
+  asrText = '给我讲一个毛线球的故事';
+  llmReply = JSON.stringify({ reply: '故事里滚来一只追毛线的小猫。', emotion: 'happy',
+    intensity: 72, action: null, camera: null,
+    drawing: { subject: '一只追毛线的小猫' } });
+  const autonomousDrawing = await fetch(`${base}/api/device/v1/conversation/stream?format=pcm&sampleRate=16000&wire=framed-v1`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'audio/pcm' }, body: audio,
+  });
+  assert.equal(autonomousDrawing.status, 200);
+  assert.equal(autonomousDrawing.headers.get('x-ai-action-type'), 'draw',
+    'a valid model drawing decision should execute without an explicit draw command');
+  const autonomousDrawingTrace = autonomousDrawing.headers.get('x-turn-trace-id');
+  await autonomousDrawing.arrayBuffer();
+  const autonomousScene = await fetch(`${base}/api/device/v1/drawing?traceId=${autonomousDrawingTrace}`,
+    { headers: deviceHeaders });
+  assert.equal(autonomousScene.status, 200);
+  assert.equal(autonomousScene.headers.get('content-type'), 'image/jpeg');
+  assert.ok((await autonomousScene.arrayBuffer()).byteLength > 256);
   drawingProposalReply = null;
   asrText = '测试成功';
   llmReply = '你好';

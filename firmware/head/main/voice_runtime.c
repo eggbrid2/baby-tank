@@ -94,6 +94,7 @@ typedef enum {
     VOICE_STATE_LISTENING,
     VOICE_STATE_PROCESSING,
     VOICE_STATE_SPEAKING,
+    VOICE_STATE_ACTING,
 } voice_state_t;
 
 typedef enum {
@@ -177,6 +178,10 @@ static TickType_t s_last_touch_reaction;
 static uint8_t s_touch_stage;
 static bool s_touch_reaction_active;
 static voice_state_t s_state = VOICE_STATE_IDLE;
+/* Covers the whole model-owned drive/drawing interval. Unlike
+ * s_explore_active, this remains true until the dialogue task has consumed
+ * the action result and is ready to reopen the microphone. */
+static atomic_bool s_action_active;
 static atomic_bool s_explore_active;
 static atomic_bool s_explore_cancel;
 static atomic_bool s_wake_ack_busy;
@@ -260,6 +265,20 @@ static void configure_wakenet(bool enabled)
     if (result < 0) {
         ESP_LOGW(TAG, "unable to %s WakeNet", enabled ? "enable" : "disable");
     }
+}
+
+static void enter_action_state(const char *kind)
+{
+    atomic_store(&s_action_active, true);
+    if (take_state_lock()) {
+        if (s_state == VOICE_STATE_SPEAKING ||
+            s_state == VOICE_STATE_PROCESSING) {
+            s_state = VOICE_STATE_ACTING;
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    configure_wakenet(false);
+    ESP_LOGI(TAG, "AI %s owns voice state; listening deferred", kind);
 }
 
 esp_err_t baby_tank_voice_runtime_play_phrase(uint8_t phrase)
@@ -384,6 +403,10 @@ static void play_wake_ack(uint32_t turn_id)
 static void complete_turn(void)
 {
     bool listen_again = false;
+    /* Release action ownership only at the common completion boundary. A
+     * deferred wake/touch can therefore never open the microphone while a
+     * motor pulse or drawing hold is still running. */
+    atomic_store(&s_action_active, false);
     if (take_state_lock()) {
         listen_again = (s_pending_listen || s_session_active) &&
                        !s_cancel_requested;
@@ -428,6 +451,15 @@ esp_err_t baby_tank_voice_runtime_request_listen(void)
 {
     ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
                         TAG, "AI voice is paused in remote mode");
+    if (atomic_load(&s_action_active)) {
+        if (take_state_lock()) {
+            s_pending_listen = true;
+            s_session_active = true;
+            xSemaphoreGive(s_state_mutex);
+        }
+        ESP_LOGI(TAG, "wake deferred until AI action completes");
+        return ESP_OK;
+    }
     if (atomic_load(&s_explore_active)) {
         atomic_store(&s_explore_cancel, true);
         baby_tank_chassis_bridge_stop();
@@ -491,6 +523,22 @@ esp_err_t baby_tank_voice_runtime_toggle_listen(void)
 {
     ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
                         TAG, "top touch is paused in remote mode");
+    if (atomic_load(&s_action_active)) {
+        /* A deliberate top touch remains an emergency motor stop, but it
+         * becomes a deferred listen request instead of opening ASR in the
+         * middle of the action. Drawings finish their short bounded hold. */
+        if (atomic_load(&s_explore_active)) {
+            atomic_store(&s_explore_cancel, true);
+            (void)baby_tank_chassis_bridge_stop();
+        }
+        if (take_state_lock()) {
+            s_pending_listen = true;
+            s_session_active = true;
+            xSemaphoreGive(s_state_mutex);
+        }
+        ESP_LOGI(TAG, "top touch deferred listening until AI action completes");
+        return ESP_OK;
+    }
     if (atomic_load(&s_explore_active)) {
         atomic_store(&s_explore_cancel, true);
         baby_tank_chassis_bridge_stop();
@@ -795,12 +843,14 @@ static void start_pending_action_group(pcm_sink_t *sink)
     sink->action_epoch = baby_tank_chassis_bridge_control_epoch();
     atomic_store(&sink->action_done, false);
     atomic_store(&s_explore_cancel, false);
+    atomic_store(&s_action_active, true);
     atomic_store(&s_explore_active, true);
     if (xTaskCreate(direct_action_group_task, "ai_action_group",
                     VOICE_ACTION_TASK_STACK, sink,
                     VOICE_ACTION_TASK_PRIORITY, NULL) != pdPASS) {
         sink->action_result = ESP_ERR_NO_MEM;
         atomic_store(&sink->action_done, true);
+        atomic_store(&s_action_active, false);
         atomic_store(&s_explore_active, false);
         ESP_LOGE(TAG, "unable to start AI action group task");
     }
@@ -1664,6 +1714,9 @@ static void dialogue_task(void *argument)
                 atomic_store(&s_explore_cancel, true);
                 (void)baby_tank_chassis_bridge_stop();
             }
+            if (sink.action_started) {
+                enter_action_state("drive");
+            }
             esp_err_t action_result = wait_for_pending_action_group(&sink);
             if (result == ESP_ERR_NOT_FOUND &&
                 utterance.kind == VOICE_REQUEST_RECORDED_SPEECH) {
@@ -1690,6 +1743,10 @@ static void dialogue_task(void *argument)
             }
             /* End speech at the actual audio boundary, not after a motor
              * action. This closes the mouth and starts the bounded face hold. */
+            if (drive_action.approved &&
+                (drive_action.explore || drive_action.draw)) {
+                enter_action_state(drive_action.draw ? "drawing" : "exploration");
+            }
             set_phase(BABY_TANK_CONVERSATION_IDLE);
             if (drive_action.approved && drive_action.explore &&
                 utterance.kind == VOICE_REQUEST_RECORDED_SPEECH) {
@@ -1770,6 +1827,7 @@ esp_err_t baby_tank_voice_runtime_start(void)
     }
     atomic_store(&s_runtime_stopping, false);
     atomic_store(&s_dialogue_busy, false);
+    atomic_store(&s_action_active, false);
     s_state = VOICE_STATE_IDLE;
     s_cancel_requested = false;
     s_pending_listen = false;
@@ -1844,6 +1902,7 @@ esp_err_t baby_tank_voice_runtime_stop(void)
     if (s_afe_data == NULL) return ESP_OK;
     size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     atomic_store(&s_runtime_stopping, true);
+    atomic_store(&s_action_active, false);
     atomic_store(&s_explore_cancel, true);
     (void)baby_tank_chassis_bridge_stop();
     baby_tank_cloud_cancel_current();

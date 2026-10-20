@@ -3,7 +3,7 @@
 This is the independent ESP32-S3 firmware for the Baby Tank head. It is not
 based on an upstream ESP-SparkBot example.
 
-The `0.14.30` build extends the safe bring-up baseline with a procedural animated
+The `0.14.31` build extends the safe bring-up baseline with a procedural animated
 robot-baby face and a half-duplex voice conversation runtime:
 
 - boot through the native USB Serial/JTAG interface;
@@ -36,6 +36,9 @@ robot-baby face and a half-duplex voice conversation runtime:
   and returns 16 kHz PCM for ES8311/I2S playback;
 - support cooperative touch barge-in during recognition, model generation, or
   playback; side touches also drive directional gaze and cloud/local reactions;
+- let the cloud model choose bounded drive or curated drawing actions, keep
+  WakeNet/ASR closed for the full action interval, and resume continuous
+  listening only after the motor/drawing completion boundary;
 - advertise `BabyTank-XXXX` over BLE and use Espressif Network Provisioning
   Security 1 with a per-device proof-of-possession code;
 - keep encrypted BLE control and diagnostic endpoints available after

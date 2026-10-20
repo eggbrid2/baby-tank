@@ -20,7 +20,14 @@
 - 手机不再复制脸、食物、咬合或吸饮动画；完整表演只在机器人屏幕发生，避免两个屏幕争夺视觉焦点。
 - BLE 仍只发送一次语义表达编号，不传连续帧。
 
-## 固件 0.14.28
+## 图集切片修复
+
+- 原始 1024×1536 图集虽然按 4×6 排列，但插画有意跨过 256×256 参考格；旧切法把下一行顶部混进上一张，同时切掉下一张自身的顶部。只删除底部串图不能解决问题。
+- 新增完整图集透明遮罩 `android/design-assets/interaction_atlas_alpha.png`，并由 `tools/extract-interaction-assets.py` 按透明连通主体提取 14 个食物和饮品。
+- 每个主体缩放进 226×226 的安全内容区，再居中放入 256×256 透明画布。果汁飞溅和热可可蒸汽作为显式附属部件保留，因此不会把相邻食物误带进来，也不会切掉后续图标。
+- Android 使用完整切图；设备端 64×64 索引精灵从同一批修复后资源重新生成，两个界面保持一致。
+
+## 固件 0.14.29
 
 - 由 `tools/generate-food-sprites.py` 将 Android 的 14 张透明 PNG 转为 64×64、31 色调色板索引图。
 - 固件资源固定占用 58,240 字节 Flash：57,344 字节像素索引和 896 字节 RGB565 调色板；运行时不创建同等大小的 SRAM 缓存。
@@ -37,10 +44,10 @@
 
 ## 构建验证
 
-- Android `0.1.5`（versionCode 6）`:app:assembleDebug`：通过。
+- Android `0.1.6`（versionCode 7）`:app:assembleDebug`：通过。
 - Android `:app:testDebugUnitTest`：任务为 `NO-SOURCE`，表示当前没有单元测试源码，不能表述为已有测试用例通过。
-- Debug APK SHA-256：`5cab74fe7c89bc7b93eeffcb474e8ec8587c91c55306ef17e7360509b2d96181`；已通过 USB 覆盖安装，`dumpsys package` 确认手机端为 versionCode 6 / versionName 0.1.5。
-- 固件 `idf.py -C firmware/head build`：通过，版本 `0.14.28`。
+- Debug APK SHA-256：`6b41ea14dc1af99ade824c905f7cd8e29625580c5bb08b9b43dd8a9afa75c7b5`；已通过 USB 覆盖安装，`dumpsys package` 确认手机端为 versionCode 7 / versionName 0.1.6。
+- 固件 `idf.py -C firmware/head build`：通过，版本 `0.14.29`。
 - 固件镜像大小 `0x31e390`（3,269,520）字节；6 MiB 应用分区剩余 `0x2e1c70` 字节，构建工具报告 48% 空闲。
-- 已通过 `/dev/cu.usbmodem2121101` 烧录头部 ESP32-S3；Flash 校验通过，启动日志确认 MAC `44:bd:8d:69:49:68`、固件 `0.14.28`、ST7789、网络、音频、WakeNet 和触摸初始化成功。
+- 已通过 `/dev/cu.usbmodem2121101` 烧录头部 ESP32-S3；Flash 校验通过，启动日志确认 MAC `44:bd:8d:69:49:68`、固件 `0.14.29` 和 ST7789 初始化成功。
 - 最终静态手机弹框安装后手机进入锁屏，ADB 无权绕过用户密码，因此尚未取得该最终状态截图；机器人 240×240 屏幕上的进食节奏也仍需人工审美验收。

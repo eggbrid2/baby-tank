@@ -3,7 +3,7 @@
 This is the independent ESP32-S3 firmware for the Baby Tank head. It is not
 based on an upstream ESP-SparkBot example.
 
-The `0.14.28` build extends the safe bring-up baseline with a procedural animated
+The `0.14.29` build extends the safe bring-up baseline with a procedural animated
 robot-baby face and a half-duplex voice conversation runtime:
 
 - boot through the native USB Serial/JTAG interface;
@@ -15,7 +15,8 @@ robot-baby face and a half-duplex voice conversation runtime:
   to trusted interaction code;
 - animate each expression as a short performance with anticipation, action,
   controlled overshoot, settle, hold, and return-to-neutral timing;
-- render the 14 feeding choices from compact 64x64 palette sprites and animate
+- render 14 complete, boundary-safe feeding choices from compact 64x64 palette
+  sprites and animate
   approach, successive bites, crumbs, chewing, straws, bubbles, and sipping;
 - add sparse micro-saccades, fast-close/slow-open asymmetric blinks, damped
   shape transitions, and event-timed manga cues such as sweat, anger marks,

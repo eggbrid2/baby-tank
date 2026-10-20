@@ -46,6 +46,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -89,6 +90,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.Lifecycle
@@ -429,6 +432,8 @@ private fun InteractionScreen(
     var diceRolling by rememberSaveable { mutableStateOf(false) }
     var userDie by rememberSaveable { mutableStateOf(1) }
     var robotDie by rememberSaveable { mutableStateOf(1) }
+    var feedingChoice by remember { mutableStateOf<ArtChoice?>(null) }
+    var feedingRun by remember { mutableStateOf(0) }
 
     fun resetRound() {
         result = ""
@@ -436,6 +441,7 @@ private fun InteractionScreen(
         robotArt = -1
         rpsBusy = false
         diceRolling = false
+        feedingChoice = null
     }
 
     fun announceResult(userOutcome: Int) {
@@ -461,6 +467,47 @@ private fun InteractionScreen(
         )
         announceResult(outcome)
         fightRunning = false
+    }
+
+    LaunchedEffect(feedingRun) {
+        val choice = feedingChoice ?: return@LaunchedEffect
+        result = ""
+        delay(3400)
+        result = if (choice.expression >= 47) "${choice.title}喝光啦" else "${choice.title}吃光啦"
+        feedingChoice = null
+    }
+
+    feedingChoice?.let { choice ->
+        Dialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false,
+                usePlatformDefaultWidth = false,
+            ),
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize()
+                    .background(Color.Black.copy(alpha = .64f))
+                    .padding(horizontal = 18.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(.72f).height(132.dp),
+                    shape = RoundedCornerShape(30.dp),
+                    colors = CardDefaults.cardColors(containerColor = Paper),
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            if (choice.expression >= 47) "正在喝…" else "正在吃…",
+                            color = Ink,
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.Black,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     Page {
@@ -522,9 +569,10 @@ private fun InteractionScreen(
                 items(foods.chunked(2)) { row ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         row.forEach { choice ->
-                            ArtChoiceButton(choice, connected, Modifier.weight(1f)) {
+                            ArtChoiceButton(choice, connected && feedingChoice == null, Modifier.weight(1f)) {
                                 tone.startTone(ToneGenerator.TONE_PROP_BEEP, 70)
-                                result = choice.title
+                                feedingChoice = choice
+                                feedingRun += 1
                                 onExpression(choice.expression)
                             }
                         }
@@ -543,9 +591,10 @@ private fun InteractionScreen(
                 items(drinks.chunked(2)) { row ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         row.forEach { choice ->
-                            ArtChoiceButton(choice, connected, Modifier.weight(1f)) {
+                            ArtChoiceButton(choice, connected && feedingChoice == null, Modifier.weight(1f)) {
                                 tone.startTone(ToneGenerator.TONE_PROP_BEEP, 70)
-                                result = choice.title
+                                feedingChoice = choice
+                                feedingRun += 1
                                 onExpression(choice.expression)
                             }
                         }
@@ -1341,7 +1390,7 @@ private fun PairScreen(
     }
     var ssid by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var showWifiSettings by remember { mutableStateOf(false) }
+    var openNetwork by remember { mutableStateOf(false) }
     var showPortal by remember { mutableStateOf(false) }
 
     DisposableEffect(showPortal) {
@@ -1431,25 +1480,9 @@ private fun PairScreen(
             }
         }
         item {
-            Text("首次使用或网络异常时，请先在手机系统 Wi-Fi 连接 BabyTank- 热点，再在这里打开配网页。",
-                color = SoftInk, fontSize = 12.sp)
-            Button(
-                onClick = { showPortal = true; onOpenPortal() },
-                modifier = Modifier.fillMaxWidth().padding(top = 10.dp).height(48.dp),
-                shape = RoundedCornerShape(18.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) { Text("打开设备配网页") }
-            OutlinedButton(
-                onClick = { showWifiSettings = !showWifiSettings },
-                enabled = phase in setOf(ScanPhase.Connected, ScanPhase.Provisioned),
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(44.dp),
-                shape = RoundedCornerShape(18.dp),
-            ) { Text(if (showWifiSettings) "收起旧版蓝牙配网" else "旧版蓝牙配网（备用）") }
-        }
-        if (showWifiSettings) {
-        item {
-            Text("Wi-Fi", fontSize = 18.sp, fontWeight = FontWeight.Black, modifier = Modifier.padding(top = 8.dp))
-            Text("机器人仅支持 2.4 GHz；手机扫描不到的热点先检查频段、距离和是否隐藏 SSID。",
+            Text("家庭 Wi-Fi", fontSize = 18.sp, fontWeight = FontWeight.Black,
+                modifier = Modifier.padding(top = 8.dp))
+            Text("在手机填写密码，通过加密蓝牙发送。仅支持 2.4 GHz。",
                 color = SoftInk, fontSize = 12.sp)
         }
         item {
@@ -1463,7 +1496,10 @@ private fun PairScreen(
         items(wifi.networks, key = { it }) { network ->
             Card(
                 modifier = Modifier.fillMaxWidth().clickable(enabled = phase == ScanPhase.Connected &&
-                    !network.startsWith("BabyTank-", ignoreCase = true)) { ssid = network },
+                    !network.startsWith("BabyTank-", ignoreCase = true)) {
+                    ssid = network
+                    openNetwork = false
+                },
                 shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(containerColor = if (ssid == network) MintWash else Paper),
             ) { Text(network, Modifier.padding(16.dp), fontWeight = FontWeight.Bold) }
@@ -1483,10 +1519,12 @@ private fun PairScreen(
             OutlinedTextField(
                 value = password,
                 onValueChange = { password = it.take(64) },
-                label = { Text("Wi-Fi 密码（开放网络留空）") },
-                supportingText = { Text("网页登录账号与密码不能填在这里") },
+                label = { Text("Wi-Fi 密码") },
+                supportingText = {
+                    Text(if (openNetwork) "开放网络无需密码" else "至少 8 位；网页登录账号不填在这里")
+                },
                 singleLine = true,
-                enabled = phase == ScanPhase.Connected,
+                enabled = phase == ScanPhase.Connected && !openNetwork,
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 shape = RoundedCornerShape(18.dp),
@@ -1494,13 +1532,33 @@ private fun PairScreen(
             )
         }
         item {
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable(enabled = phase == ScanPhase.Connected) {
+                    openNetwork = !openNetwork
+                    if (openNetwork) password = ""
+                },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(
+                    checked = openNetwork,
+                    onCheckedChange = {
+                        openNetwork = it
+                        if (it) password = ""
+                    },
+                    enabled = phase == ScanPhase.Connected,
+                )
+                Text("开放网络（无密码）", fontWeight = FontWeight.Bold)
+            }
+        }
+        item {
             Button(
                 onClick = {
-                    onProvision(ssid.trim(), password.toCharArray())
+                    onProvision(ssid.trim(), if (openNetwork) charArrayOf() else password.toCharArray())
                     password = ""
                 },
                 enabled = phase == ScanPhase.Connected && ssid.isNotBlank() &&
-                    !ssid.startsWith("BabyTank-", ignoreCase = true),
+                    !ssid.startsWith("BabyTank-", ignoreCase = true) &&
+                    (openNetwork || password.length >= 8),
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(18.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),
@@ -1514,6 +1572,16 @@ private fun PairScreen(
                 )
             }
         }
+        item {
+            HorizontalDivider(Modifier.padding(vertical = 6.dp), color = Line)
+            Text("备用配网", fontSize = 16.sp, fontWeight = FontWeight.Black)
+            Text("先在系统 Wi-Fi 连接 BabyTank- 热点。设备热点保持加密。",
+                color = SoftInk, fontSize = 12.sp)
+            OutlinedButton(
+                onClick = { showPortal = true; onOpenPortal() },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(46.dp),
+                shape = RoundedCornerShape(18.dp),
+            ) { Text("打开设备配网页") }
         }
     }
 }

@@ -5,6 +5,8 @@
  * timing model stay isolated from the ST7789 transport bring-up code.
  */
 
+#include "food_sprites.inc"
+
 typedef struct {
     float width;
     float height;
@@ -166,6 +168,15 @@ static void premium_configure_targets(baby_tank_expression_t expression)
     s_mouth.open_height.target = target->mouth.open_height;
     s_mouth.offset_x.target = target->mouth.offset_x;
     s_mouth.offset_y.target = target->mouth.offset_y;
+    if (expression >= BABY_TANK_EXPRESSION_STRAWBERRY &&
+        expression <= BABY_TANK_EXPRESSION_COCOA) {
+        /* The food enters from screen-right. Both eyes track it without
+         * introducing pupils that would break the established face style. */
+        s_left_eye.offset_x.target += 5.0f;
+        s_right_eye.offset_x.target += 5.0f;
+        s_left_eye.offset_y.target += 2.0f;
+        s_right_eye.offset_y.target += 2.0f;
+    }
 }
 
 static float premium_interval(uint32_t time_ms, uint32_t start_ms, uint32_t end_ms)
@@ -339,6 +350,7 @@ static bool premium_expression_can_speak(baby_tank_expression_t expression)
 }
 
 static void premium_draw_mouth(baby_tank_expression_t expression,
+                               uint32_t elapsed_ms,
                                uint8_t speech_level,
                                uint16_t cream)
 {
@@ -347,6 +359,22 @@ static void premium_draw_mouth(baby_tank_expression_t expression,
     int open = rounded_float(s_mouth.open_height.value);
     int x = 120 + rounded_float(s_mouth.offset_x.value);
     int y = 146 + rounded_float(s_mouth.offset_y.value);
+    bool eating = expression >= BABY_TANK_EXPRESSION_STRAWBERRY &&
+                  expression <= BABY_TANK_EXPRESSION_ICE_CREAM;
+    bool drinking = expression >= BABY_TANK_EXPRESSION_MILK &&
+                    expression <= BABY_TANK_EXPRESSION_COCOA;
+    if (eating && elapsed_ms >= 820U) {
+        uint32_t phase = (elapsed_ms - 820U) % 460U;
+        int chew = phase < 230U ? (int)(phase * 1000U / 230U) :
+                   (int)((460U - phase) * 1000U / 230U);
+        width = 27 + chew * 5 / 1000;
+        open = 5 + chew * 14 / 1000;
+        y += chew * 3 / 1000;
+    } else if (drinking && elapsed_ms >= 760U && elapsed_ms < 3100U) {
+        width = 13;
+        open = 8 + smooth_wave(elapsed_ms, 360U, 2);
+        x += 2;
+    }
     if (speech_level > 4U && premium_expression_can_speak(expression)) {
         int speech_width = width + (int)speech_level * 5 / 100;
         int speech_open = 5 + (int)speech_level * 12 / 100;
@@ -573,87 +601,44 @@ static bool premium_is_full_screen_game(baby_tank_expression_t expression)
             expression <= BABY_TANK_EXPRESSION_DICE_6);
 }
 
-static void premium_draw_food_item(baby_tank_expression_t expression,
-                                   int x, int y,
-                                   uint16_t cyan, uint16_t cream,
-                                   uint16_t coral, uint16_t black)
+static bool premium_food_pixel_eaten(int x, int y, uint8_t bite_stage)
 {
-    switch (expression) {
-    case BABY_TANK_EXPRESSION_STRAWBERRY:
-        fill_ellipse(x, y + 2, 15, 18, coral);
-        draw_line(x - 10, y - 14, x, y - 21, 4, cyan);
-        draw_line(x + 10, y - 14, x, y - 21, 4, cyan);
-        fill_circle(x - 5, y, 2, cream);
-        fill_circle(x + 5, y + 5, 2, cream);
-        break;
-    case BABY_TANK_EXPRESSION_APPLE:
-        fill_circle(x - 7, y + 2, 15, coral);
-        fill_circle(x + 7, y + 2, 15, coral);
-        draw_line(x, y - 13, x + 3, y - 24, 3, cream);
-        fill_ellipse(x + 11, y - 18, 8, 4, cyan);
-        break;
-    case BABY_TANK_EXPRESSION_BANANA:
-        draw_curve(x - 20, y - 8, x - 2, y + 25,
-                   x + 22, y - 8, 9, cream);
-        draw_curve(x - 17, y - 10, x - 1, y + 15,
-                   x + 18, y - 11, 4, black);
-        break;
-    case BABY_TANK_EXPRESSION_CAKE:
-        fill_round_rect_center(x, y + 6, 39, 27, 5, cream);
-        fill_rect(x - 19, y - 10, 39, 8, coral);
-        draw_line(x, y - 11, x, y - 27, 3, cyan);
-        fill_circle(x, y - 30, 4, coral);
-        break;
-    case BABY_TANK_EXPRESSION_COOKIE:
-        fill_circle(x, y, 21, cream);
-        fill_circle(x - 8, y - 7, 3, black);
-        fill_circle(x + 8, y - 2, 3, black);
-        fill_circle(x - 2, y + 10, 3, black);
-        break;
-    case BABY_TANK_EXPRESSION_BREAD:
-        fill_round_rect_center(x, y + 2, 43, 31, 10, cream);
-        fill_round_rect_center(x, y + 5, 34, 22, 7, coral);
-        fill_round_rect_center(x, y + 6, 29, 18, 6, black);
-        break;
-    case BABY_TANK_EXPRESSION_RICE_BALL:
-        draw_line(x, y - 24, x - 25, y + 19, 6, cream);
-        draw_line(x, y - 24, x + 25, y + 19, 6, cream);
-        draw_line(x - 25, y + 19, x + 25, y + 19, 6, cream);
-        fill_rect(x - 9, y + 4, 18, 19, cyan);
-        break;
-    case BABY_TANK_EXPRESSION_ICE_CREAM:
-        fill_circle(x, y - 13, 18, coral);
-        fill_circle(x - 9, y - 5, 13, cream);
-        draw_line(x - 15, y + 5, x, y + 30, 5, cream);
-        draw_line(x + 14, y + 5, x, y + 30, 5, cream);
-        break;
-    case BABY_TANK_EXPRESSION_MILK:
-    case BABY_TANK_EXPRESSION_JUICE:
-    case BABY_TANK_EXPRESSION_WATER:
-    case BABY_TANK_EXPRESSION_YOGURT:
-    case BABY_TANK_EXPRESSION_SOY_MILK:
-    case BABY_TANK_EXPRESSION_COCOA: {
-        uint16_t body = expression == BABY_TANK_EXPRESSION_JUICE ? coral :
-                        expression == BABY_TANK_EXPRESSION_WATER ? cyan : cream;
-        if (expression == BABY_TANK_EXPRESSION_COCOA) {
-            fill_round_rect_center(x, y + 2, 41, 32, 8, coral);
-            draw_bubble(x + 25, y + 3, 10, cream);
-            draw_curve(x - 7, y - 18, x - 13, y - 27,
-                       x - 5, y - 33, 2, cream);
-        } else {
-            fill_round_rect_center(x, y + 2, 37, 46, 7, body);
-            fill_round_rect_center(x, y + 2, 27, 35, 5, black);
-            fill_circle(x, y + 2, 7,
-                        expression == BABY_TANK_EXPRESSION_WATER ? cream : cyan);
-            if (expression == BABY_TANK_EXPRESSION_YOGURT) {
-                fill_rect(x - 22, y - 24, 44, 6, coral);
-            }
-        }
-        break;
+    if (bite_stage >= 4U) return true;
+    int dx = x + 27;
+    int dy = y + 5;
+    if (bite_stage >= 1U && dx * dx + dy * dy <= 15 * 15) return true;
+    dx = x + 18;
+    dy = y - 15;
+    if (bite_stage >= 2U && dx * dx + dy * dy <= 18 * 18) return true;
+    dx = x + 2;
+    dy = y + 10;
+    if (bite_stage >= 3U && (x < 1 || dx * dx + dy * dy <= 21 * 21)) {
+        return true;
     }
-    default:
-        fill_circle(x, y, 14, cream);
-        break;
+    return false;
+}
+
+static void premium_draw_food_sprite(baby_tank_expression_t expression,
+                                     int center_x, int center_y,
+                                     uint8_t bite_stage)
+{
+    const baby_tank_food_sprite_t *sprite =
+        baby_tank_food_sprite_for_expression(expression);
+    if (sprite == NULL) return;
+    bool food = expression <= BABY_TANK_EXPRESSION_ICE_CREAM;
+    for (int y = 0; y < BABY_TANK_FOOD_SPRITE_SIZE; ++y) {
+        for (int x = 0; x < BABY_TANK_FOOD_SPRITE_SIZE; ++x) {
+            size_t offset = (size_t)y * BABY_TANK_FOOD_SPRITE_SIZE + (size_t)x;
+            uint8_t palette_index = sprite->pixels[offset];
+            if (palette_index == BABY_TANK_FOOD_TRANSPARENT) continue;
+            int local_x = x - BABY_TANK_FOOD_SPRITE_SIZE / 2;
+            int local_y = y - BABY_TANK_FOOD_SPRITE_SIZE / 2;
+            if (food && premium_food_pixel_eaten(local_x, local_y, bite_stage)) {
+                continue;
+            }
+            set_pixel(center_x + local_x, center_y + local_y,
+                      sprite->palette[palette_index]);
+        }
     }
 }
 
@@ -731,15 +716,45 @@ static void premium_draw_interaction_overlay(baby_tank_expression_t expression,
     } else if (expression >= BABY_TANK_EXPRESSION_STRAWBERRY &&
                expression <= BABY_TANK_EXPRESSION_COCOA) {
         bool drink = expression >= BABY_TANK_EXPRESSION_MILK;
-        int approach = (int)((elapsed_ms / 24U) % 24U);
-        int x = drink ? 170 - approach / 3 : 170 - approach;
-        int y = 151 + beat;
-        premium_draw_food_item(expression, x, y, cyan, cream, coral, black);
+        int approach = rounded_float(
+            premium_interval(elapsed_ms, 0U, drink ? 760U : 860U) * 1000.0f);
+        int x = 205 - approach * (drink ? 43 : 53) / 1000;
+        int y = 166 - approach * (drink ? 17 : 13) / 1000;
         if (drink) {
-            draw_line(151, y - 20, 139, 130, 3, cream);
+            if (elapsed_ms < 3250U) {
+                int sip = elapsed_ms > 760U ?
+                    smooth_wave(elapsed_ms - 760U, 420U, 2) : 0;
+                premium_draw_food_sprite(expression, x + sip, y, 0U);
+                draw_line(x - 22 + sip, y - 18, 131, 148, 3, cream);
+                if (elapsed_ms > 1050U) {
+                    int bubble_y = y - 34 - (int)((elapsed_ms / 85U) % 16U);
+                    fill_circle(x + 14, bubble_y, 2, cyan);
+                    if (((elapsed_ms / 260U) & 1U) != 0U) {
+                        fill_circle(x + 21, bubble_y + 7, 1, cream);
+                    }
+                }
+            }
         } else {
-            draw_line(93, 137 + beat, 101, 141 + beat, 2, cyan);
-            draw_line(90, 148 + beat, 100, 149 + beat, 2, cream);
+            uint8_t bite_stage = elapsed_ms < 1120U ? 0U :
+                                 elapsed_ms < 1610U ? 1U :
+                                 elapsed_ms < 2110U ? 2U :
+                                 elapsed_ms < 2650U ? 3U : 4U;
+            int nibble = bite_stage > 0U && bite_stage < 4U &&
+                         ((elapsed_ms / 90U) & 1U) != 0U ? -3 : 0;
+            premium_draw_food_sprite(expression, x + nibble, y + beat,
+                                     bite_stage);
+            if (bite_stage > 0U && bite_stage < 4U) {
+                uint32_t bite_start = bite_stage == 1U ? 1120U :
+                                      bite_stage == 2U ? 1610U : 2110U;
+                uint32_t age = elapsed_ms - bite_start;
+                if (age < 330U) {
+                    int fall = (int)(age / 32U);
+                    fill_circle(137 - (int)bite_stage * 4,
+                                156 + fall, 2, cream);
+                    fill_circle(145 - (int)bite_stage * 3,
+                                151 + fall / 2, 1, coral);
+                }
+            }
         }
     }
 }
@@ -861,7 +876,7 @@ static void draw_expression(baby_tank_expression_t expression,
         premium_draw_eye(&s_right_eye, false, 170, 112, cyan, black);
     }
     if (!full_screen_game) {
-        premium_draw_mouth(expression, speech_level, cream);
+        premium_draw_mouth(expression, elapsed_ms, speech_level, cream);
     }
     if (expression == BABY_TANK_EXPRESSION_SLEEPING) {
         premium_draw_sleep_details(elapsed_ms, cyan, cream, black);

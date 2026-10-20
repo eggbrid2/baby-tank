@@ -353,7 +353,7 @@ private fun HomeScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("BABY TANK", fontSize = 11.sp, letterSpacing = 2.sp, color = CyanDeep, fontWeight = FontWeight.Black)
-                Text("喵喵同学", fontSize = 28.sp, fontWeight = FontWeight.Black, color = Ink)
+                Text("和喵喵一起玩", fontSize = 27.sp, fontWeight = FontWeight.Black, color = Ink)
             }
             Card(
                 modifier = Modifier.size(44.dp).clickable(onClick = onSettings),
@@ -369,85 +369,60 @@ private fun HomeScreen(
     }
     item {
         Card(
-            shape = RoundedCornerShape(32.dp),
-            colors = CardDefaults.cardColors(containerColor = Ink),
-            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(36.dp),
+            colors = CardDefaults.cardColors(containerColor = PeachWash),
+            modifier = Modifier.fillMaxWidth().clickable(
+                onClick = if (connected) onTalk else onConnect,
+            ),
         ) {
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 16.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 17.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text("我的宝宝", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Black)
+                        Text("点点我", color = Ink, fontSize = 19.sp, fontWeight = FontWeight.Black)
                         Text(
-                            if (connected) "正在陪着你" else "连接后一起玩",
-                            color = Color.White.copy(.58f),
+                            if (connected) "我会听你说话" else "请爸爸妈妈先连接",
+                            color = SoftInk,
                             fontSize = 12.sp,
                         )
                     }
-                    Card(
-                        modifier = Modifier.clickable(enabled = !connected, onClick = onConnect),
-                        shape = RoundedCornerShape(50),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (connected) Cyan.copy(.18f) else Color.White.copy(.10f),
-                        ),
+                    Box(
+                        Modifier.size(38.dp).background(Paper.copy(.78f), CircleShape),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Row(
-                            Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Box(Modifier.size(7.dp).background(if (connected) Cyan else Coral, CircleShape))
-                            Spacer(Modifier.width(7.dp))
-                            Text(
-                                if (connected) "已连接" else "去连接",
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                            )
-                        }
+                        MiniGlyph(GlyphKind.Dialogue, true, Modifier.size(22.dp), tint = Coral)
                     }
                 }
-                BabyFace(Modifier.fillMaxWidth().height(188.dp), connected = connected)
+                BabyFace(
+                    Modifier.fillMaxWidth(.88f).height(170.dp),
+                    connected = connected,
+                )
             }
         }
     }
     item {
-        Card(
-            modifier = Modifier.fillMaxWidth().clickable(onClick = onDrive),
-            shape = RoundedCornerShape(28.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Box(
-                Modifier.fillMaxWidth().background(
-                    Brush.linearGradient(listOf(Cyan, Color(0xFF72EEE4))),
-                ).padding(horizontal = 20.dp, vertical = 19.dp),
-            ) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(54.dp).background(Ink, RoundedCornerShape(18.dp)), contentAlignment = Alignment.Center) {
-                        MiniGlyph(GlyphKind.Control, true, Modifier.size(29.dp), tint = Color.White)
-                    }
-                    Spacer(Modifier.width(15.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("遥控探险", fontSize = 21.sp, fontWeight = FontWeight.Black, color = Ink)
-                        Text("打开画面，马上出发", fontSize = 12.sp, color = Ink.copy(.64f))
-                    }
-                    Box(Modifier.size(36.dp).background(Color.White.copy(.42f), CircleShape), contentAlignment = Alignment.Center) {
-                        MiniGlyph(GlyphKind.Right, true, Modifier.size(19.dp))
-                    }
-                }
-            }
-        }
-    }
-    item {
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            HomeActionCard(
-                "和我说话", "摸摸它也可以", MintWash, GlyphKind.Signal,
-                Modifier.weight(1f), if (connected) onTalk else onConnect,
+            ChildActionCard(
+                title = "开车",
+                color = SkyWash,
+                modifier = Modifier.weight(1f),
+                onClick = if (connected) onDrive else onConnect,
+                illustration = { DriveToyIcon(Modifier.size(104.dp)) },
             )
-            HomeActionCard(
-                "一起玩", "游戏、投喂、戳一戳", Lavender.copy(alpha = .55f), GlyphKind.Character,
-                Modifier.weight(1f), onPlay,
+            ChildActionCard(
+                title = "一起玩",
+                color = ButterWash,
+                modifier = Modifier.weight(1f),
+                onClick = if (connected) onPlay else onConnect,
+                illustration = {
+                    InteractionArtIcon(InteractionArt.Games, Ink, Modifier.size(112.dp))
+                },
             )
         }
     }
@@ -1422,32 +1397,61 @@ private fun SettingsRow(
 }
 
 @Composable
-private fun HomeActionCard(
+private fun ChildActionCard(
     title: String,
-    subtitle: String,
     color: Color,
-    glyph: GlyphKind,
     modifier: Modifier,
     onClick: () -> Unit,
+    illustration: @Composable () -> Unit,
 ) {
     Card(
-        modifier = modifier.height(132.dp).clickable(onClick = onClick),
-        shape = RoundedCornerShape(26.dp),
+        modifier = modifier.height(184.dp).clickable(onClick = onClick),
+        shape = RoundedCornerShape(30.dp),
         colors = CardDefaults.cardColors(containerColor = color),
     ) {
         Column(
-            Modifier.fillMaxSize().padding(17.dp),
-            verticalArrangement = Arrangement.SpaceBetween,
+            Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 13.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(7.dp),
         ) {
-            Box(Modifier.size(40.dp).background(Paper.copy(.72f), RoundedCornerShape(14.dp)),
-                contentAlignment = Alignment.Center) {
-                MiniGlyph(glyph, true, Modifier.size(23.dp))
+            Box(
+                Modifier.fillMaxWidth().weight(1f),
+                contentAlignment = Alignment.Center,
+            ) {
+                illustration()
             }
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(title, fontWeight = FontWeight.Black, fontSize = 17.sp, color = Ink)
-                Text(subtitle, color = SoftInk, fontSize = 11.sp, maxLines = 1)
-            }
+            Text(title, fontWeight = FontWeight.Black, fontSize = 21.sp, color = Ink)
         }
+    }
+}
+
+@Composable
+private fun DriveToyIcon(modifier: Modifier = Modifier) {
+    Box(
+        modifier.background(Ink, RoundedCornerShape(31.dp)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(Modifier.size(31.dp).background(Cyan, CircleShape))
+        MiniGlyph(
+            GlyphKind.Up, true,
+            Modifier.align(Alignment.TopCenter).padding(top = 8.dp).size(25.dp),
+            tint = Color.White,
+        )
+        MiniGlyph(
+            GlyphKind.Down, true,
+            Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp).size(25.dp),
+            tint = Color.White,
+        )
+        MiniGlyph(
+            GlyphKind.Left, true,
+            Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(25.dp),
+            tint = Color.White,
+        )
+        MiniGlyph(
+            GlyphKind.Right, true,
+            Modifier.align(Alignment.CenterEnd).padding(end = 8.dp).size(25.dp),
+            tint = Color.White,
+        )
     }
 }
 

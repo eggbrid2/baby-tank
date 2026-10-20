@@ -16,6 +16,9 @@ val Cream = Color(0xFFFFE6AD)
 val Coral = Color(0xFFFF8069)
 val Lavender = Color(0xFFC9BCFF)
 val MintWash = Color(0xFFDDF8F5)
+val PeachWash = Color(0xFFFFE7DF)
+val ButterWash = Color(0xFFFFEBC1)
+val SkyWash = Color(0xFFDDF3FA)
 val Line = Color(0xFFE3E0D8)
 
 private val LightColors = lightColorScheme(

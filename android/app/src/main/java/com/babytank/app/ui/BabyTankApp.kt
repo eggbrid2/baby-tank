@@ -362,7 +362,12 @@ private fun HomeScreen(
                 border = androidx.compose.foundation.BorderStroke(1.dp, Line),
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    MiniGlyph(GlyphKind.Settings, true, Modifier.size(21.dp))
+                    Image(
+                        painter = painterResource(R.drawable.icon_parent_settings),
+                        contentDescription = "家长设置",
+                        modifier = Modifier.size(36.dp),
+                        contentScale = ContentScale.Fit,
+                    )
                 }
             }
         }
@@ -393,12 +398,19 @@ private fun HomeScreen(
                         Modifier.size(38.dp).background(Paper.copy(.78f), CircleShape),
                         contentAlignment = Alignment.Center,
                     ) {
-                        MiniGlyph(GlyphKind.Dialogue, true, Modifier.size(22.dp), tint = Coral)
+                        Image(
+                            painter = painterResource(R.drawable.icon_home_talk),
+                            contentDescription = null,
+                            modifier = Modifier.size(31.dp),
+                            contentScale = ContentScale.Fit,
+                        )
                     }
                 }
-                BabyFace(
-                    Modifier.fillMaxWidth(.88f).height(170.dp),
-                    connected = connected,
+                Image(
+                    painter = painterResource(R.drawable.icon_home_talk),
+                    contentDescription = "和喵喵说话",
+                    modifier = Modifier.fillMaxWidth(.88f).height(170.dp),
+                    contentScale = ContentScale.Fit,
                 )
             }
         }
@@ -413,7 +425,14 @@ private fun HomeScreen(
                 color = SkyWash,
                 modifier = Modifier.weight(1f),
                 onClick = if (connected) onDrive else onConnect,
-                illustration = { DriveToyIcon(Modifier.size(104.dp)) },
+                illustration = {
+                    Image(
+                        painter = painterResource(R.drawable.icon_home_drive),
+                        contentDescription = "开车",
+                        modifier = Modifier.size(118.dp),
+                        contentScale = ContentScale.Fit,
+                    )
+                },
             )
             ChildActionCard(
                 title = "一起玩",
@@ -1422,36 +1441,6 @@ private fun ChildActionCard(
             }
             Text(title, fontWeight = FontWeight.Black, fontSize = 21.sp, color = Ink)
         }
-    }
-}
-
-@Composable
-private fun DriveToyIcon(modifier: Modifier = Modifier) {
-    Box(
-        modifier.background(Ink, RoundedCornerShape(31.dp)),
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(Modifier.size(31.dp).background(Cyan, CircleShape))
-        MiniGlyph(
-            GlyphKind.Up, true,
-            Modifier.align(Alignment.TopCenter).padding(top = 8.dp).size(25.dp),
-            tint = Color.White,
-        )
-        MiniGlyph(
-            GlyphKind.Down, true,
-            Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp).size(25.dp),
-            tint = Color.White,
-        )
-        MiniGlyph(
-            GlyphKind.Left, true,
-            Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(25.dp),
-            tint = Color.White,
-        )
-        MiniGlyph(
-            GlyphKind.Right, true,
-            Modifier.align(Alignment.CenterEnd).padding(end = 8.dp).size(25.dp),
-            tint = Color.White,
-        )
     }
 }
 

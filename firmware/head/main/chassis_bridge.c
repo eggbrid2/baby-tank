@@ -1,4 +1,5 @@
 #include "chassis_bridge.h"
+#include "runtime_policy.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -210,6 +211,7 @@ uint32_t baby_tank_chassis_bridge_control_epoch(void)
 esp_err_t baby_tank_chassis_bridge_drive(int16_t left_per_mille,
                                          int16_t right_per_mille)
 {
+    if (baby_tank_policy_is_locked()) return ESP_ERR_INVALID_STATE;
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (left_per_mille < -CHASSIS_MAX_PER_MILLE ||
         left_per_mille > CHASSIS_MAX_PER_MILLE ||
@@ -290,6 +292,7 @@ esp_err_t baby_tank_chassis_bridge_get_battery_percent(uint8_t *percent)
 
 esp_err_t baby_tank_chassis_bridge_light_mode(uint8_t mode)
 {
+    if (baby_tank_policy_is_locked()) return ESP_ERR_INVALID_STATE;
     if (!s_ready || (mode != 2U && mode != 6U && mode != 8U)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -318,6 +321,7 @@ static esp_err_t pulse_internal(int16_t left_per_mille,
                                 uint16_t duration_ms, bool guarded,
                                 uint32_t expected_epoch)
 {
+    if (baby_tank_policy_is_locked()) return ESP_ERR_INVALID_STATE;
     int16_t left_magnitude = left_per_mille < 0
         ? (int16_t)-left_per_mille : left_per_mille;
     int16_t right_magnitude = right_per_mille < 0
@@ -354,9 +358,16 @@ static esp_err_t pulse_internal(int16_t left_per_mille,
     if (result != ESP_OK) return result;
     int64_t deadline_us = esp_timer_get_time() + (int64_t)duration_ms * 1000;
     while (esp_timer_get_time() < deadline_us) {
+        if (baby_tank_policy_is_locked()) {
+            (void)baby_tank_chassis_bridge_stop();
+            return ESP_ERR_INVALID_STATE;
+        }
         xSemaphoreTake(s_tx_lock, portMAX_DELAY);
-        if (s_control_epoch != epoch || !s_link_verified) {
+        if (s_control_epoch != epoch || !s_link_verified ||
+            baby_tank_policy_is_locked()) {
             xSemaphoreGive(s_tx_lock);
+            if (baby_tank_policy_is_locked())
+                (void)baby_tank_chassis_bridge_stop();
             return ESP_ERR_INVALID_STATE;
         }
         portENTER_CRITICAL(&s_lock);

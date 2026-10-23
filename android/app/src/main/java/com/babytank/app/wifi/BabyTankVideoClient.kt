@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
@@ -25,8 +26,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,6 +42,8 @@ class BabyTankVideoClient(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutableState = MutableStateFlow(VideoState())
     val state: StateFlow<VideoState> = mutableState.asStateFlow()
+    private val mutableFrame = MutableStateFlow<Bitmap?>(null)
+    val frame: StateFlow<Bitmap?> = mutableFrame.asStateFlow()
     private var callback: ConnectivityManager.NetworkCallback? = null
     private var streamJob: Job? = null
     @Volatile private var connection: HttpURLConnection? = null
@@ -163,9 +168,9 @@ class BabyTankVideoClient(context: Context) {
         startStreaming(network, STREAM_URL, null)
     }
 
-    fun showManualAp() {
+    fun showManualAp(deviceName: String = "BabyTank") {
         mutableState.value = VideoState(VideoPhase.NeedsManualWifi,
-            "手机与机器人不在同一网段。请在系统 WLAN 手动连接 BabyTank-694968，允许无互联网，再返回点击连接摄像头。")
+            "手机与机器人不在同一网段。请在系统 WLAN 手动连接 $deviceName，允许无互联网，再返回点击连接摄像头。")
     }
 
     private fun findDeviceApNetwork(): Network? = connectivity.allNetworks.firstOrNull { network ->
@@ -253,27 +258,56 @@ class BabyTankVideoClient(context: Context) {
         check(http.responseCode == HttpURLConnection.HTTP_OK) {
             "HTTP ${http.responseCode}"
         }
-        var frameCount = 0
-        var windowStarted = System.currentTimeMillis()
         http.inputStream.buffered(32 * 1024).use { input ->
-            while (currentCoroutineContext().isActive) {
-                val jpeg = readJpeg(input) ?: return
-                val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: continue
-                frameCount += 1
-                val now = System.currentTimeMillis()
-                val elapsed = now - windowStarted
-                val fps = if (elapsed >= 1_000) {
-                    val measured = ((frameCount * 1_000L) / elapsed).toInt()
-                    frameCount = 0
-                    windowStarted = now
-                    measured
-                } else mutableState.value.framesPerSecond
-                mutableState.value = VideoState(
-                    VideoPhase.Streaming,
-                    "本地视频已连接",
-                    bitmap,
-                    fps,
-                )
+            coroutineScope {
+                /* Never make the socket wait for JPEG decoding or Compose.
+                 * A live preview values the newest image; queued old frames
+                 * only add latency and push TCP backpressure into the ESP32. */
+                val latestFrames = Channel<ByteArray>(Channel.CONFLATED)
+                launch {
+                    try {
+                        while (currentCoroutineContext().isActive) {
+                            val jpeg = readJpeg(input) ?: break
+                            latestFrames.trySend(jpeg)
+                        }
+                    } finally {
+                        latestFrames.close()
+                    }
+                }
+                var frameCount = 0
+                var windowStarted = System.currentTimeMillis()
+                val decodeOptions = BitmapFactory.Options().apply {
+                    /* The camera source is RGB565. Keeping that format on the
+                     * phone halves per-frame bitmap churn and avoids periodic
+                     * GC pauses in the Compose preview. */
+                    inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+                }
+                for (jpeg in latestFrames) {
+                    val bitmap = BitmapFactory.decodeByteArray(
+                        jpeg, 0, jpeg.size, decodeOptions) ?: continue
+                    mutableFrame.value = bitmap
+                    frameCount += 1
+                    val now = System.currentTimeMillis()
+                    val elapsed = now - windowStarted
+                    val publishStatus = mutableState.value.phase != VideoPhase.Streaming ||
+                        elapsed >= 1_000
+                    val fps = if (elapsed >= 1_000) {
+                        val measured = ((frameCount * 1_000L) / elapsed).toInt()
+                        frameCount = 0
+                        windowStarted = now
+                        measured
+                    } else mutableState.value.framesPerSecond
+                    /* Frame delivery has its own flow. Updating VideoState for
+                     * every JPEG made the entire remote screen recompose at
+                     * camera rate; only publish status/FPS changes here. */
+                    if (publishStatus) {
+                        mutableState.value = VideoState(
+                            phase = VideoPhase.Streaming,
+                            detail = "本地视频已连接",
+                            framesPerSecond = fps,
+                        )
+                    }
+                }
             }
         }
     }
@@ -323,6 +357,7 @@ class BabyTankVideoClient(context: Context) {
             runCatching { connectivity.unregisterNetworkCallback(it) }
         }
         callback = null
+        mutableFrame.value = null
         if (resetState) mutableState.value = VideoState()
     }
 

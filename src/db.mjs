@@ -65,6 +65,23 @@ export function openDatabase(path, bootstrap = {}) {
       created_at TEXT NOT NULL,
       UNIQUE(version, board, channel)
     );
+    CREATE TABLE IF NOT EXISTS cloud_accounts (
+      id INTEGER PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      display_name TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+      email_verified_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cloud_sessions (
+      token_hash TEXT PRIMARY KEY,
+      account_id INTEGER NOT NULL REFERENCES cloud_accounts(id) ON DELETE CASCADE,
+      csrf_token TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY,
       action TEXT NOT NULL,
@@ -119,6 +136,91 @@ export function openDatabase(path, bootstrap = {}) {
       thought_key TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS device_dream_decks (
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      local_day TEXT NOT NULL,
+      entries_json TEXT NOT NULL,
+      source TEXT NOT NULL CHECK(source IN ('ai','fallback')),
+      generated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS character_state (
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      needs_json TEXT NOT NULL,
+      time_zone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+      deep_night_lock INTEGER NOT NULL DEFAULT 0 CHECK(deep_night_lock IN (0,1)),
+      revision INTEGER NOT NULL DEFAULT 1,
+      policy_revision INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS character_state_events (
+      id INTEGER PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      event_id TEXT NOT NULL,
+      source TEXT NOT NULL CHECK(source IN ('device','parent','conversation')),
+      kind TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(device_id,event_id)
+    );
+    CREATE TABLE IF NOT EXISTS character_state_ack (
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      policy_revision INTEGER NOT NULL DEFAULT 0,
+      personality_revision INTEGER NOT NULL DEFAULT 0,
+      clock_quality TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(clock_quality IN ('verified','estimated','unknown')),
+      night_lock_active INTEGER NOT NULL DEFAULT 0 CHECK(night_lock_active IN (0,1)),
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS character_personality (
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      curiosity INTEGER NOT NULL CHECK(curiosity BETWEEN 0 AND 100),
+      warmth INTEGER NOT NULL CHECK(warmth BETWEEN 0 AND 100),
+      talkativeness INTEGER NOT NULL CHECK(talkativeness BETWEEN 0 AND 100),
+      revision INTEGER NOT NULL DEFAULT 1,
+      source TEXT NOT NULL DEFAULT 'default'
+        CHECK(source IN ('default','device','parent')),
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS approved_memories (
+      id TEXT PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('nickname','preference','shared_activity')),
+      subject TEXT NOT NULL,
+      value_ciphertext TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      expires_at TEXT,
+      revision INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS question_history_policy (
+      device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+      enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+      retention_days INTEGER NOT NULL DEFAULT 30 CHECK(retention_days BETWEEN 1 AND 30),
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS question_history (
+      id INTEGER PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      trace_id TEXT NOT NULL,
+      question_ciphertext TEXT NOT NULL,
+      answer_ciphertext TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(device_id,trace_id)
+    );
+    CREATE TABLE IF NOT EXISTS parent_claims (
+      code_hash TEXT PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS parent_sessions (
+      token_hash TEXT PRIMARY KEY,
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS ai_action_log (
       id INTEGER PRIMARY KEY,
       trace_id TEXT NOT NULL UNIQUE,
@@ -165,15 +267,28 @@ export function openDatabase(path, bootstrap = {}) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_firmware_release ON firmware(board, channel, published);
+    CREATE INDEX IF NOT EXISTS idx_cloud_accounts_created ON cloud_accounts(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cloud_sessions_account ON cloud_sessions(account_id,expires_at);
     CREATE INDEX IF NOT EXISTS idx_devices_seen ON devices(last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_ota_device_time ON ota_events(device_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_conversation_metrics_time ON conversation_metrics(created_at);
     CREATE INDEX IF NOT EXISTS idx_conversation_turns_device ON conversation_turns(device_id,id DESC);
     CREATE INDEX IF NOT EXISTS idx_device_mood_events_device ON device_mood_events(device_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_character_state_events_device ON character_state_events(device_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_approved_memories_device ON approved_memories(device_id,updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_question_history_device ON question_history(device_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_parent_sessions_device ON parent_sessions(device_id,expires_at);
     CREATE INDEX IF NOT EXISTS idx_ai_action_log_time ON ai_action_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_ai_exploration_events_trace ON ai_exploration_events(trace_id,id);
     CREATE INDEX IF NOT EXISTS idx_ai_camera_events_trace ON ai_camera_events(trace_id,id);
   `);
+
+  // Existing devices already have character_state rows. A policy version
+  // must not advance when a child feeds the character or an event is retried.
+  if (!db.prepare('PRAGMA table_info(character_state)').all()
+    .some((column) => column.name === 'policy_revision')) {
+    db.exec('ALTER TABLE character_state ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 1');
+  }
 
   const count = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
   if (count === 0) {

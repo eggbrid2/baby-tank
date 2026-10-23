@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <net/if.h>
+#include <netinet/tcp.h>
+#include <sys/time.h>
 
 #include "driver/i2c_types.h"
 #include "esp_camera.h"
@@ -17,6 +19,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "wifi_portal.h"
@@ -37,13 +40,21 @@
 #define CAMERA_PIN_D6 17
 #define CAMERA_PIN_D7 16
 
-#define CAMERA_XCLK_HZ 10000000
-#define CAMERA_FRAME_INTERVAL_MS 100
+#define CAMERA_XCLK_HZ 16000000
+/* The station connection uses a full-channel, strongest-BSSID scan so the
+ * phone and robot can share the best mesh node without taking the phone off
+ * its Internet Wi-Fi. Keep the 15 fps target; the one-frame ready queue still
+ * replaces stale work if a particular client falls behind. */
+#define CAMERA_FRAME_INTERVAL_MS 66
 #define CAMERA_JPEG_QUALITY 72
 #define CAMERA_FRAME_SIZE FRAMESIZE_HQVGA
 #define CAMERA_WIDTH 240
 #define CAMERA_HEIGHT 176
 #define CAMERA_JPEG_OUTPUT_CAPACITY (128U * 1024U)
+/* One buffer may be in TCP send while the producer needs one current output
+ * plus one queued slot whose stale frame can be replaced. Two buffers made
+ * the queued frame wait behind every slow send (measured 481-495 ms). */
+#define CAMERA_JPEG_BUFFER_COUNT 3U
 #define STREAM_PREFIX_CAPACITY 128U
 
 static const char *TAG = "baby_tank_camera";
@@ -64,39 +75,105 @@ static uint8_t s_lan_token[16];
 static bool s_lan_token_ready;
 static const bool s_lan_route = true;
 static jpeg_enc_handle_t s_jpeg_encoder;
-static uint8_t *s_jpeg_output;
+static uint8_t *s_jpeg_output[CAMERA_JPEG_BUFFER_COUNT];
+
+typedef struct {
+    uint8_t index;
+    size_t length;
+    int64_t capture_ms;
+    int64_t encode_ms;
+    int64_t ready_us;
+} stream_frame_t;
+
+typedef struct {
+    QueueHandle_t free_buffers;
+    QueueHandle_t ready_frames;
+    TaskHandle_t consumer;
+    atomic_bool stop;
+    atomic_uint dropped;
+} stream_pipeline_t;
+
+typedef struct {
+    uint8_t *data;
+    size_t capacity;
+    size_t length;
+    bool overflow;
+} jpeg_buffer_writer_t;
 
 static esp_err_t start_camera_hardware(void);
 static void stop_camera_hardware(void);
 
-static bool encode_stream_jpeg(const camera_fb_t *frame, const uint8_t **data,
-                               size_t *length, uint8_t **temporary)
+static size_t write_camera_jpeg(void *argument, size_t index,
+                                const void *data, size_t length)
 {
-    *temporary = NULL;
-    if (frame->format == PIXFORMAT_JPEG) {
-        *data = frame->buf;
+    jpeg_buffer_writer_t *writer = argument;
+    if (data == NULL || length == 0U) return 0U;
+    if (index > writer->capacity || length > writer->capacity - index) {
+        writer->overflow = true;
+        return length;
+    }
+    memcpy(writer->data + index, data, length);
+    writer->length = index + length;
+    return length;
+}
+
+static bool encode_stream_jpeg(const camera_fb_t *frame, uint8_t *output,
+                               size_t *length)
+{
+    if (output == NULL) return false;
+    uint8_t *destination = output + STREAM_PREFIX_CAPACITY;
+    size_t capacity = CAMERA_JPEG_OUTPUT_CAPACITY - STREAM_PREFIX_CAPACITY;
+    if (frame->format == PIXFORMAT_JPEG && frame->len <= capacity) {
+        memcpy(destination, frame->buf, frame->len);
         *length = frame->len;
         return true;
     }
-    if (s_jpeg_encoder != NULL && s_jpeg_output != NULL &&
-        frame->format == PIXFORMAT_RGB565 &&
+    if (frame->format == PIXFORMAT_RGB565 &&
         frame->len == CAMERA_WIDTH * CAMERA_HEIGHT * 2U) {
-        int encoded = 0;
-        jpeg_error_t status = jpeg_enc_process(
-            s_jpeg_encoder, frame->buf, (int)frame->len,
-            s_jpeg_output + STREAM_PREFIX_CAPACITY,
-            CAMERA_JPEG_OUTPUT_CAPACITY - STREAM_PREFIX_CAPACITY, &encoded);
-        if (status == JPEG_ERR_OK && encoded >= 128 &&
-            (size_t)encoded <= CAMERA_JPEG_OUTPUT_CAPACITY) {
-            *data = s_jpeg_output + STREAM_PREFIX_CAPACITY;
-            *length = (size_t)encoded;
+        /* Capture corruption was caused by direct camera DMA into PSRAM, not
+         * by JPEG conversion. Keep the safe staged-DMA capture configuration
+         * and use esp_new_jpeg's much faster RGB565 encoder. */
+        if (s_jpeg_encoder != NULL) {
+            int encoded = 0;
+            jpeg_error_t status = jpeg_enc_process(
+                s_jpeg_encoder, frame->buf, (int)frame->len,
+                destination, (int)capacity, &encoded);
+            if (status == JPEG_ERR_OK && encoded >= 128 &&
+                (size_t)encoded <= capacity) {
+                *length = (size_t)encoded;
+                return true;
+            }
+            ESP_LOGW(TAG, "optimized JPEG encode failed status=%d bytes=%d",
+                     status, encoded);
+        }
+        /* Retain the component's reference converter as a correctness
+         * fallback. It is slower but prevents a stream outage if the fast
+         * encoder rejects a frame. */
+        jpeg_buffer_writer_t writer = {
+            .data = destination,
+            .capacity = capacity,
+        };
+        bool encoded = frame2jpg_cb((camera_fb_t *)frame,
+                                    CAMERA_JPEG_QUALITY,
+                                    write_camera_jpeg, &writer);
+        if (encoded && !writer.overflow && writer.length >= 128U) {
+            *length = writer.length;
             return true;
         }
-        ESP_LOGW(TAG, "optimized JPEG encode failed: %d", status);
+        ESP_LOGW(TAG, "esp32-camera JPEG encode failed overflow=%d bytes=%zu",
+                 writer.overflow, writer.length);
     }
-    if (!frame2jpg((camera_fb_t *)frame, CAMERA_JPEG_QUALITY, temporary,
-                   length)) return false;
-    *data = *temporary;
+    uint8_t *temporary = NULL;
+    size_t temporary_length = 0;
+    bool converted = frame2jpg((camera_fb_t *)frame, CAMERA_JPEG_QUALITY,
+                               &temporary, &temporary_length);
+    if (!converted || temporary == NULL || temporary_length > capacity) {
+        free(temporary);
+        return false;
+    }
+    memcpy(destination, temporary, temporary_length);
+    free(temporary);
+    *length = temporary_length;
     return true;
 }
 
@@ -214,6 +291,66 @@ esp_err_t baby_tank_camera_stream_capture_jpeg(uint8_t **jpeg, size_t *size)
     return ESP_OK;
 }
 
+static void stream_producer_task(void *argument)
+{
+    stream_pipeline_t *pipeline = argument;
+    while (!atomic_load(&pipeline->stop) && !atomic_load(&s_stopping)) {
+        uint8_t index = 0U;
+        if (xQueueReceive(pipeline->free_buffers, &index,
+                          pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        if (atomic_load(&pipeline->stop) || atomic_load(&s_stopping)) {
+            (void)xQueueSend(pipeline->free_buffers, &index, 0);
+            break;
+        }
+        int64_t started = esp_timer_get_time();
+        if (xSemaphoreTake(s_camera_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            (void)xQueueSend(pipeline->free_buffers, &index, 0);
+            continue;
+        }
+        camera_fb_t *frame = esp_camera_fb_get();
+        if (frame == NULL) {
+            xSemaphoreGive(s_camera_lock);
+            (void)xQueueSend(pipeline->free_buffers, &index, 0);
+            continue;
+        }
+        int64_t captured = esp_timer_get_time();
+        size_t length = 0U;
+        bool encoded = encode_stream_jpeg(frame, s_jpeg_output[index], &length);
+        esp_camera_fb_return(frame);
+        xSemaphoreGive(s_camera_lock);
+        int64_t finished = esp_timer_get_time();
+        if (!encoded) {
+            (void)xQueueSend(pipeline->free_buffers, &index, 0);
+            continue;
+        }
+        stream_frame_t ready = {
+            .index = index,
+            .length = length,
+            .capture_ms = (captured - started) / 1000,
+            .encode_ms = (finished - captured) / 1000,
+            .ready_us = finished,
+        };
+        if (xQueueSend(pipeline->ready_frames, &ready, 0) != pdTRUE) {
+            /* The network/UI is behind. Replace the queued frame so latency
+             * stays bounded instead of replaying stale camera images. */
+            stream_frame_t stale = {0};
+            if (xQueueReceive(pipeline->ready_frames, &stale, 0) == pdTRUE) {
+                atomic_fetch_add(&pipeline->dropped, 1U);
+                (void)xQueueSend(pipeline->free_buffers, &stale.index, 0);
+            }
+            if (xQueueSend(pipeline->ready_frames, &ready, 0) != pdTRUE) {
+                (void)xQueueSend(pipeline->free_buffers, &index, 0);
+            }
+        }
+        int64_t elapsed_ms = (esp_timer_get_time() - started) / 1000;
+        if (elapsed_ms < CAMERA_FRAME_INTERVAL_MS) {
+            vTaskDelay(pdMS_TO_TICKS(CAMERA_FRAME_INTERVAL_MS - elapsed_ms));
+        }
+    }
+    xTaskNotifyGive(pipeline->consumer);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t stream_handler(httpd_req_t *request)
 {
     if (!authorize_lan(request)) return ESP_OK;
@@ -221,41 +358,68 @@ static esp_err_t stream_handler(httpd_req_t *request)
         httpd_resp_set_status(request, "429 Too Many Requests");
         return httpd_resp_sendstr(request, "one video client is already active");
     }
+    /* Multipart framing adds a very small chunk header before every JPEG.
+     * Do not let that header wait for Nagle/delayed-ACK coalescing: the JPEG
+     * already is the useful batching unit and each frame is latency-sensitive. */
+    int socket_fd = httpd_req_to_sockfd(request);
+    int no_delay = 1;
+    const struct timeval send_timeout = {
+        .tv_sec = 3,
+        .tv_usec = 0,
+    };
+    if (socket_fd < 0 ||
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay,
+                   sizeof(no_delay)) < 0) {
+        ESP_LOGW(TAG, "unable to enable TCP_NODELAY for video stream");
+    }
+    if (socket_fd >= 0 &&
+        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout,
+                   sizeof(send_timeout)) < 0) {
+        ESP_LOGW(TAG, "unable to set video send timeout");
+    }
     httpd_resp_set_type(request, STREAM_TYPE);
     httpd_resp_set_hdr(request, "Cache-Control", "no-store, max-age=0");
     httpd_resp_set_hdr(request, "Connection", "close");
     esp_err_t result = ESP_OK;
     uint32_t frame_number = 0;
+    stream_pipeline_t pipeline = {
+        .free_buffers = xQueueCreate(CAMERA_JPEG_BUFFER_COUNT, sizeof(uint8_t)),
+        .ready_frames = xQueueCreate(1U, sizeof(stream_frame_t)),
+        .consumer = xTaskGetCurrentTaskHandle(),
+    };
+    if (pipeline.free_buffers == NULL || pipeline.ready_frames == NULL) {
+        if (pipeline.free_buffers != NULL) vQueueDelete(pipeline.free_buffers);
+        if (pipeline.ready_frames != NULL) vQueueDelete(pipeline.ready_frames);
+        xSemaphoreGive(s_stream_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    for (uint8_t index = 0U; index < CAMERA_JPEG_BUFFER_COUNT; ++index) {
+        (void)xQueueSend(pipeline.free_buffers, &index, 0);
+    }
+    TaskHandle_t producer = NULL;
+    if (xTaskCreatePinnedToCore(stream_producer_task, "camera_encode", 5120U,
+                                &pipeline, 4, &producer, 1) != pdPASS) {
+        vQueueDelete(pipeline.free_buffers);
+        vQueueDelete(pipeline.ready_frames);
+        xSemaphoreGive(s_stream_lock);
+        return ESP_ERR_NO_MEM;
+    }
     while (result == ESP_OK && !atomic_load(&s_stopping)) {
-        int64_t started = esp_timer_get_time();
-        if (xSemaphoreTake(s_camera_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        stream_frame_t frame = {0};
+        if (xQueueReceive(pipeline.ready_frames, &frame,
+                          pdMS_TO_TICKS(2000)) != pdTRUE) {
             result = ESP_ERR_TIMEOUT;
             break;
         }
-        camera_fb_t *frame = esp_camera_fb_get();
-        if (frame == NULL) {
-            xSemaphoreGive(s_camera_lock);
-            result = ESP_FAIL;
-            break;
-        }
-        int64_t captured = esp_timer_get_time();
-
-        uint8_t *converted = NULL;
-        size_t length = frame->len;
-        const uint8_t *data = frame->buf;
-        if (!encode_stream_jpeg(frame, &data, &length, &converted)) {
-            esp_camera_fb_return(frame);
-            xSemaphoreGive(s_camera_lock);
-            result = ESP_FAIL;
-            break;
-        }
-        int64_t encoded = esp_timer_get_time();
+        int64_t sending = esp_timer_get_time();
+        uint8_t *output = s_jpeg_output[frame.index];
+        size_t length = frame.length;
 
         char part[64];
         int part_length = snprintf(part, sizeof(part), STREAM_PART, length);
         if (part_length <= 0 || (size_t)part_length >= sizeof(part)) {
             result = ESP_ERR_INVALID_SIZE;
-        } else if (data == s_jpeg_output + STREAM_PREFIX_CAPACITY) {
+        } else {
             /* One HTTP chunk avoids three small writes and their Wi-Fi/TCP
              * scheduling overhead. Prefix sits immediately before JPEG. */
             size_t boundary_length = strlen(STREAM_BOUNDARY);
@@ -263,8 +427,7 @@ static esp_err_t stream_handler(httpd_req_t *request)
             if (prefix_length > STREAM_PREFIX_CAPACITY) {
                 result = ESP_ERR_INVALID_SIZE;
             } else {
-                uint8_t *combined = s_jpeg_output +
-                                    STREAM_PREFIX_CAPACITY - prefix_length;
+                uint8_t *combined = output + STREAM_PREFIX_CAPACITY - prefix_length;
                 memcpy(combined, STREAM_BOUNDARY, boundary_length);
                 memcpy(combined + boundary_length, part,
                        (size_t)part_length);
@@ -272,33 +435,26 @@ static esp_err_t stream_handler(httpd_req_t *request)
                                                (const char *)combined,
                                                prefix_length + length);
             }
-        } else {
-            result = httpd_resp_send_chunk(request, STREAM_BOUNDARY,
-                                           strlen(STREAM_BOUNDARY));
-            if (result == ESP_OK) {
-                result = httpd_resp_send_chunk(request, part, part_length);
-            }
-            if (result == ESP_OK) {
-                result = httpd_resp_send_chunk(request, (const char *)data,
-                                               length);
-            }
         }
-        free(converted);
-        esp_camera_fb_return(frame);
-        xSemaphoreGive(s_camera_lock);
+        int64_t sent = esp_timer_get_time();
+        (void)xQueueSend(pipeline.free_buffers, &frame.index,
+                         pdMS_TO_TICKS(100));
         if (result == ESP_OK && ++frame_number % 10 == 0) {
-            ESP_LOGI(TAG, "stream frame=%lu bytes=%zu capture=%lld ms encode=%lld ms send=%lld ms",
+            ESP_LOGI(TAG, "stream frame=%lu bytes=%zu capture=%lld ms encode=%lld ms queue=%lld ms send=%lld ms dropped=%lu",
                      (unsigned long)frame_number, length,
-                     (long long)((captured - started) / 1000),
-                     (long long)((encoded - captured) / 1000),
-                     (long long)((esp_timer_get_time() - encoded) / 1000));
-        }
-
-        int64_t elapsed_ms = (esp_timer_get_time() - started) / 1000;
-        if (result == ESP_OK && elapsed_ms < CAMERA_FRAME_INTERVAL_MS) {
-            vTaskDelay(pdMS_TO_TICKS(CAMERA_FRAME_INTERVAL_MS - elapsed_ms));
+                     (long long)frame.capture_ms,
+                     (long long)frame.encode_ms,
+                     (long long)((sending - frame.ready_us) / 1000),
+                     (long long)((sent - sending) / 1000),
+                     (unsigned long)atomic_load(&pipeline.dropped));
         }
     }
+    atomic_store(&pipeline.stop, true);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1500)) == 0U && producer != NULL) {
+        vTaskDelete(producer);
+    }
+    vQueueDelete(pipeline.free_buffers);
+    vQueueDelete(pipeline.ready_frames);
     xSemaphoreGive(s_stream_lock);
     ESP_LOGI(TAG, "video client disconnected: %s", esp_err_to_name(result));
     return result;
@@ -401,11 +557,15 @@ static esp_err_t start_camera_hardware(void)
         .pixel_format = PIXFORMAT_RGB565,
         .frame_size = CAMERA_FRAME_SIZE,
         .jpeg_quality = 0,
-        /* GC2145 provides uncompressed RGB565. With Wi-Fi active, two
-         * continuous frame buffers can lose PSRAM writes and corrupt rows. */
-        .fb_count = 1,
+        /* Two PSRAM frame buffers keep capture and encoding independent. The
+         * camera DMA itself is deliberately staged through internal SRAM;
+         * direct PSRAM DMA corrupts RGB565 rows on this ESP32-S3 setup. */
+        .fb_count = 2,
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+        /* A preview should show the newest available frame. If networking
+         * briefly stalls, discard the older sensor buffer instead of showing
+         * it later and accumulating visible control latency. */
+        .grab_mode = CAMERA_GRAB_LATEST,
     };
     ESP_RETURN_ON_ERROR(esp_camera_init(&config), TAG,
                         "GC2145 initialization failed");
@@ -415,25 +575,36 @@ static esp_err_t start_camera_hardware(void)
         stop_camera_hardware();
         return ESP_FAIL;
     }
-    s_jpeg_output = heap_caps_malloc(CAMERA_JPEG_OUTPUT_CAPACITY,
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_jpeg_output != NULL) {
-        jpeg_enc_config_t encoder_config = DEFAULT_JPEG_ENC_CONFIG();
-        encoder_config.width = CAMERA_WIDTH;
-        encoder_config.height = CAMERA_HEIGHT;
-        encoder_config.src_type = JPEG_PIXEL_FORMAT_RGB565_BE;
-        encoder_config.subsampling = JPEG_SUBSAMPLE_420;
-        encoder_config.quality = CAMERA_JPEG_QUALITY;
-        jpeg_error_t status = jpeg_enc_open(&encoder_config, &s_jpeg_encoder);
-        if (status != JPEG_ERR_OK) {
-            ESP_LOGW(TAG, "optimized JPEG encoder unavailable: %d", status);
-            s_jpeg_encoder = NULL;
-            free(s_jpeg_output);
-            s_jpeg_output = NULL;
+    bool output_ready = true;
+    for (size_t index = 0U; index < CAMERA_JPEG_BUFFER_COUNT; ++index) {
+        s_jpeg_output[index] = heap_caps_malloc(
+            CAMERA_JPEG_OUTPUT_CAPACITY,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_jpeg_output[index] == NULL) output_ready = false;
+    }
+    if (!output_ready) {
+        for (size_t index = 0U; index < CAMERA_JPEG_BUFFER_COUNT; ++index) {
+            free(s_jpeg_output[index]);
+            s_jpeg_output[index] = NULL;
         }
+        stop_camera_hardware();
+        return ESP_ERR_NO_MEM;
+    }
+    jpeg_enc_config_t encoder_config = DEFAULT_JPEG_ENC_CONFIG();
+    encoder_config.width = CAMERA_WIDTH;
+    encoder_config.height = CAMERA_HEIGHT;
+    encoder_config.src_type = JPEG_PIXEL_FORMAT_RGB565_BE;
+    encoder_config.subsampling = JPEG_SUBSAMPLE_420;
+    encoder_config.quality = CAMERA_JPEG_QUALITY;
+    jpeg_error_t encoder_status = jpeg_enc_open(&encoder_config,
+                                                &s_jpeg_encoder);
+    if (encoder_status != JPEG_ERR_OK) {
+        ESP_LOGW(TAG, "optimized JPEG encoder unavailable: %d",
+                 encoder_status);
+        s_jpeg_encoder = NULL;
     }
     ESP_LOGI(TAG, "JPEG encoder=%s internal_free=%u largest=%u",
-             s_jpeg_encoder != NULL ? "optimized" : "software fallback",
+             s_jpeg_encoder != NULL ? "esp_new_jpeg" : "reference fallback",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return ESP_OK;
@@ -445,8 +616,10 @@ static void stop_camera_hardware(void)
         jpeg_enc_close(s_jpeg_encoder);
         s_jpeg_encoder = NULL;
     }
-    free(s_jpeg_output);
-    s_jpeg_output = NULL;
+    for (size_t index = 0U; index < CAMERA_JPEG_BUFFER_COUNT; ++index) {
+        free(s_jpeg_output[index]);
+        s_jpeg_output[index] = NULL;
+    }
     if (s_hardware_ready) {
         esp_err_t result = esp_camera_deinit();
         if (result != ESP_OK) {

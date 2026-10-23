@@ -725,7 +725,6 @@ static void premium_draw_interaction_overlay(baby_tank_expression_t expression,
                 int sip = elapsed_ms > 760U ?
                     smooth_wave(elapsed_ms - 760U, 420U, 2) : 0;
                 premium_draw_food_sprite(expression, x + sip, y, 0U);
-                draw_line(x - 22 + sip, y - 18, 131, 148, 3, cream);
                 if (elapsed_ms > 1050U) {
                     int bubble_y = y - 34 - (int)((elapsed_ms / 85U) % 16U);
                     fill_circle(x + 14, bubble_y, 2, cyan);

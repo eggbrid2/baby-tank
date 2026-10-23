@@ -56,6 +56,8 @@ class BabyTankProvisioner(context: Context) {
     val personalityStatus: StateFlow<String> = mutablePersonalityStatus.asStateFlow()
     private val mutableDiagnosticState = MutableStateFlow(DiagnosticState())
     val diagnosticState: StateFlow<DiagnosticState> = mutableDiagnosticState.asStateFlow()
+    private val mutableCloudDeviceId = MutableStateFlow<String?>(null)
+    val cloudDeviceId: StateFlow<String?> = mutableCloudDeviceId.asStateFlow()
     private var espDevice: ESPDevice? = null
     private var connectingDevice: NearbyDevice? = null
     private val motionLock = Any()
@@ -220,6 +222,7 @@ class BabyTankProvisioner(context: Context) {
         }
         stopScan()
         connectingDevice = device
+        mutableCloudDeviceId.value = null
         resetBleOperations()
         espDevice?.disconnectDevice()
         espDevice = manager.createESPDevice(
@@ -362,9 +365,37 @@ class BabyTankProvisioner(context: Context) {
         }
     }
 
+    fun refreshCloudIdentity() {
+        val device = espDevice ?: return
+        enqueueBleOperation { done ->
+            device.sendDataToCustomEndPoint("baby-identity", byteArrayOf(1),
+                object : ResponseListener {
+                    override fun onSuccess(returnData: ByteArray) {
+                        val length = returnData.getOrNull(1)?.toInt()?.and(0xff) ?: 0
+                        val id = if (returnData.size == length + 2 && length in 1..64 &&
+                            returnData[0].toInt() == 1) {
+                            String(returnData, 2, length, Charsets.UTF_8)
+                                .takeIf { it.matches(Regex("[A-Za-z0-9._-]{1,64}")) }
+                        } else null
+                        mutableCloudDeviceId.value = id
+                        done()
+                    }
+
+                    override fun onFailure(error: Exception) {
+                        mutableCloudDeviceId.value = null
+                        done()
+                    }
+                })
+        }
+    }
+
     fun refreshDiagnostics() = sendDiagnostic(0, label = "设备状态")
 
     fun showExpression(index: Int) {
+        showExpressionConfirmed(index, null)
+    }
+
+    fun showExpressionConfirmed(index: Int, onAccepted: ((Boolean) -> Unit)?) {
         val duration = if (index == 24) 1700 else 6000
         sendDiagnostic(
             opcode = 1,
@@ -373,6 +404,7 @@ class BabyTankProvisioner(context: Context) {
             argument2 = duration and 0xff,
             argument3 = duration shr 8,
             label = "表情测试",
+            onAccepted = onAccepted,
         )
     }
 
@@ -410,7 +442,45 @@ class BabyTankProvisioner(context: Context) {
         label = "游戏结果",
     )
 
+    fun announceGameResultConfirmed(result: Int, onAccepted: (Boolean) -> Unit) =
+        sendDiagnostic(opcode = 9, argument0 = result.coerceIn(0, 2),
+            label = "游戏结果", onAccepted = onAccepted)
+
+    /** Completes the on-head eating animation and returns the session reaction:
+     * 0 normal, 1 favorite, 2 less preferred, 3 repeated, 4 after-meal drink. */
+    fun finishFeeding(item: Int, onResult: (Boolean, Int) -> Unit) =
+        sendDiagnostic(
+            opcode = 10,
+            argument0 = item,
+            label = "喂食反馈",
+            onDetailed = onResult,
+        )
+
+    /** Uses the same offline voice/face pool as a physical side touch. */
+    fun pokeConfirmed(onAccepted: (Boolean) -> Unit) =
+        sendDiagnostic(opcode = 11, label = "戳一戳", onAccepted = onAccepted)
+
+    /** Enters ordinary wakeable sleep; deep-night policy is a separate gate. */
+    fun sleepConfirmed(onAccepted: (Boolean) -> Unit) =
+        sendDiagnostic(opcode = 12, label = "睡觉", onAccepted = onAccepted)
+
     fun startListening() = sendDiagnostic(opcode = 5, label = "语音对话")
+
+    fun stopListening() = sendDiagnostic(opcode = 13, label = "结束对话")
+
+    fun restartDevice(onAccepted: (Boolean) -> Unit) = sendDiagnostic(
+        opcode = 14,
+        label = "重新启动设备",
+        onAccepted = onAccepted,
+    )
+
+    fun setSetupHotspot(enabled: Boolean, onAccepted: (Boolean) -> Unit) =
+        sendDiagnostic(
+            opcode = 15,
+            argument0 = if (enabled) 1 else 0,
+            label = if (enabled) "开启配网热点" else "关闭配网热点",
+            onAccepted = onAccepted,
+        )
 
     fun setRemoteMode(enabled: Boolean) = sendDiagnostic(
         opcode = 6,
@@ -432,6 +502,8 @@ class BabyTankProvisioner(context: Context) {
         argument4: Int = 0,
         argument5: Int = 0,
         label: String,
+        onAccepted: ((Boolean) -> Unit)? = null,
+        onDetailed: ((Boolean, Int) -> Unit)? = null,
     ) {
         val device = espDevice
         if (device == null || mutableState.value.phase !in
@@ -440,6 +512,8 @@ class BabyTankProvisioner(context: Context) {
             mutableDiagnosticState.value = DiagnosticState(
                 DiagnosticPhase.Failed, "请先连接 Baby Tank", label,
             )
+            onAccepted?.invoke(false)
+            onDetailed?.invoke(false, 0)
             return
         }
         val request = byteArrayOf(
@@ -462,6 +536,8 @@ class BabyTankProvisioner(context: Context) {
                             DiagnosticPhase.Failed, "固件诊断协议不兼容", label,
                         )
                         done()
+                        onAccepted?.invoke(false)
+                        onDetailed?.invoke(false, 0)
                         return
                     }
                     val status = returnData[2].toInt() and 0xff
@@ -479,6 +555,8 @@ class BabyTankProvisioner(context: Context) {
                         snapshot = snapshot,
                     )
                     done()
+                    onAccepted?.invoke(status == 0)
+                    onDetailed?.invoke(status == 0, returnData[39].toInt() and 0xff)
                 }
 
                 override fun onFailure(error: Exception) {
@@ -488,6 +566,8 @@ class BabyTankProvisioner(context: Context) {
                         lastCommand = label,
                     )
                     done()
+                    onAccepted?.invoke(false)
+                    onDetailed?.invoke(false, 0)
                 }
                 },
             )
@@ -503,6 +583,7 @@ class BabyTankProvisioner(context: Context) {
             (u8(index + 3).toLong() shl 24)
         val flags = u8(3)
         return DiagnosticSnapshot(
+            setupHotspotEnabled = u8(11) and (1 shl 1) != 0,
             wifiConnected = flags and (1 shl 0) != 0,
             cloudReady = flags and (1 shl 1) != 0,
             softApReady = flags and (1 shl 2) != 0,
@@ -516,7 +597,7 @@ class BabyTankProvisioner(context: Context) {
             speechLevel = u8(6),
             speakerVolume = u8(38).coerceIn(0, 100),
             conversationPhase = u8(7),
-            remoteControlMode = u8(11) != 0,
+            remoteControlMode = u8(11) and 1 != 0,
             touchActiveMask = u8(8),
             internetPhase = u8(9),
             uptimeSeconds = u32(12),
@@ -541,6 +622,13 @@ class BabyTankProvisioner(context: Context) {
                 override fun onSuccess(returnData: ByteArray) {
                     if (returnData.size != 22 || returnData[0].toInt() != 1) {
                         onResult(Result.failure(IllegalStateException("设备摄像头协议不兼容")))
+                        done()
+                        return
+                    }
+                    if (returnData[1].toInt() == 2) {
+                        onResult(Result.failure(IllegalStateException(
+                            "设备处于深夜休眠或时间待校准，请先让头部联网同步时间",
+                        )))
                         done()
                         return
                     }
@@ -581,7 +669,11 @@ class BabyTankProvisioner(context: Context) {
                         returnData[1].toInt() != 2) {
                         onResult(Result.success(Unit))
                     } else {
-                        onResult(Result.failure(IllegalStateException("设备热点未能启动")))
+                        onResult(Result.failure(IllegalStateException(
+                            if (returnData.size == 22 && returnData[1].toInt() == 2)
+                                "设备处于深夜休眠或时间待校准，请先让头部联网同步时间"
+                            else "设备热点未能启动",
+                        )))
                     }
                     done()
                 }
@@ -743,8 +835,10 @@ class BabyTankProvisioner(context: Context) {
                 // Starting diagnostics and camera-info in parallel here caused
                 // duplicate handshakes and left the remote disabled.
                 testControlChannel()
+                refreshCloudIdentity()
             }
             ESPConstants.EVENT_DEVICE_DISCONNECTED -> {
+                mutableCloudDeviceId.value = null
                 resetBleOperations()
                 synchronized(motionLock) {
                     ++motionGeneration

@@ -8,6 +8,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
 import WebSocket from 'ws';
+import sharp from 'sharp';
 import { createApp } from '../src/server.mjs';
 
 test('admin, provider, device and safe OTA flow', async (t) => {
@@ -15,7 +16,9 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   let upstreamAuthorization = '';
   const llmRequests = [];
   let llmReply = '你好';
+  let driveRouterReply = null;
   let drawingProposalReply = null;
+  let drawingProposalReplies = null;
   let asrText = '测试成功';
   let ttsApiKey = '';
   let ttsRequest = null;
@@ -37,9 +40,12 @@ test('admin, provider, device and safe OTA flow', async (t) => {
       upstreamAuthorization = init.headers.authorization;
       const request = JSON.parse(init.body);
       llmRequests.push(request);
-      const content = drawingProposalReply &&
-        request.messages[0]?.content.includes('Fluent Emoji SVG')
-        ? drawingProposalReply : llmReply;
+      const content = request.messages[0]?.content.includes('行走工具选择器')
+        ? driveRouterReply ?? JSON.stringify({ action: (() => {
+          try { return JSON.parse(llmReply).action ?? null; } catch { return null; }
+        })() })
+        : request.messages[0]?.content.includes('儿童矢量插画的画师')
+          ? drawingProposalReplies?.shift() ?? drawingProposalReply ?? llmReply : llmReply;
       return new Response(JSON.stringify({ id: 'mock', model: request.model, choices: [{ message: { role: 'assistant', content } }] }),
         { status: 200, headers: { 'content-type': 'application/json' } });
     }
@@ -108,11 +114,54 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   t.after(() => { globalThis.fetch = nativeFetch; server.close(); rmSync(dataDir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${server.address().port}`;
 
+  const homePage = await fetch(`${base}/`);
+  assert.equal(homePage.status, 200);
+  assert.match(await homePage.text(), /会看你/);
+
+  const consolePage = await fetch(`${base}/console`);
+  assert.equal(consolePage.status, 200);
+  assert.match(await consolePage.text(), /创建云端账号/);
+
   for (const route of ['/account', '/account/']) {
     const accountPage = await fetch(`${base}${route}`);
     assert.equal(accountPage.status, 200);
     assert.match(await accountPage.text(), /修改管理员密码/);
   }
+
+  const noPublicRelease = await fetch(`${base}/api/public/v1/releases`);
+  assert.deepEqual(await noPublicRelease.json(), { releases: [] });
+
+  const missingConsent = await fetch(`${base}/api/cloud/v1/register`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'guardian@example.com', displayName: '小坦克家长',
+      password: 'cloud-password-1234' }),
+  });
+  assert.equal(missingConsent.status, 400);
+  const registration = await fetch(`${base}/api/cloud/v1/register`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'guardian@example.com', displayName: '小坦克家长',
+      password: 'cloud-password-1234', guardianConfirmed: true, termsAccepted: true }),
+  });
+  assert.equal(registration.status, 201);
+  const duplicateRegistration = await fetch(`${base}/api/cloud/v1/register`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'GUARDIAN@example.com', displayName: '重复用户',
+      password: 'cloud-password-5678', guardianConfirmed: true, termsAccepted: true }),
+  });
+  assert.equal(duplicateRegistration.status, 409);
+
+  const cloudLogin = await fetch(`${base}/api/cloud/v1/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'guardian@example.com', password: 'cloud-password-1234' }),
+  });
+  assert.equal(cloudLogin.status, 200);
+  const cloudAuth = await cloudLogin.json();
+  const cloudCookie = cloudLogin.headers.get('set-cookie').split(';')[0];
+  const cloudMe = await fetch(`${base}/api/cloud/v1/me`, { headers: { cookie: cloudCookie } });
+  assert.equal((await cloudMe.json()).account.email, 'guardian@example.com');
+  const cloudLogout = await fetch(`${base}/api/cloud/v1/logout`, { method: 'POST',
+    headers: { cookie: cloudCookie, 'x-csrf-token': cloudAuth.csrfToken } });
+  assert.equal(cloudLogout.status, 200);
 
   const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: config.adminPassword }) });
@@ -135,6 +184,104 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(enrollment.status, 201);
   const { token } = await enrollment.json();
   const deviceHeaders = { authorization: `Bearer ${token}` };
+  const identity = await fetch(`${base}/api/device/v1/identity`,
+    { headers: deviceHeaders });
+  assert.equal(identity.status, 200);
+  assert.equal((await identity.json()).deviceId, 'tank-001');
+  const anonymousIdentity = await fetch(`${base}/api/device/v1/identity`);
+  assert.equal(anonymousIdentity.status, 401);
+  const pairing = await fetch(`${base}/api/admin/parent-claims`, {
+    method: 'POST', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-001' }) });
+  assert.equal(pairing.status, 201);
+  const pairingCode = (await pairing.json()).code;
+  const parentClaim = await fetch(`${base}/api/parent/v1/claim`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: pairingCode }) });
+  assert.equal(parentClaim.status, 200);
+  const parentToken = (await parentClaim.json()).token;
+  assert.notEqual(parentToken, token);
+  const parentHeaders = { authorization: `Bearer ${parentToken}` };
+  const replayClaim = await fetch(`${base}/api/parent/v1/claim`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: pairingCode }) });
+  assert.equal(replayClaim.status, 401);
+  const parentMe = await fetch(`${base}/api/parent/v1/me`, { headers: parentHeaders });
+  assert.equal((await parentMe.json()).deviceId, 'tank-001');
+  const secondEnrollment = await fetch(`${base}/api/admin/devices`, {
+    method: 'POST', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-002', name: 'Other Tank', board: 'baby-tank-s3' }) });
+  assert.equal(secondEnrollment.status, 201);
+  const scopedState = await fetch(`${base}/api/parent/v1/state?deviceId=tank-002`,
+    { headers: parentHeaders });
+  assert.equal((await scopedState.json()).deviceId, 'tank-001',
+    'a query parameter cannot switch the parent session to another device');
+  const privateWithoutParent = await fetch(`${base}/api/parent/v1/questions`,
+    { headers: deviceHeaders });
+  assert.equal(privateWithoutParent.status, 401);
+
+  const stateBefore = await fetch(`${base}/api/device/v2/state`, { headers: deviceHeaders });
+  assert.equal(stateBefore.status, 200);
+  const stateBeforeBody = await stateBefore.json();
+  assert.equal(stateBeforeBody.state.revision, 1);
+  assert.equal(stateBeforeBody.state.enforcement, 'preview_only');
+  const stateEventId = 'cf2c0ec5-78ba-426a-9046-71aa1d18e75e';
+  const stateEvent = await fetch(`${base}/api/device/v2/state/events`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ eventId: stateEventId, kind: 'side_touch' }) });
+  assert.equal(stateEvent.status, 200);
+  assert.equal((await stateEvent.json()).state.needs.bond, 57);
+  const stateRetry = await fetch(`${base}/api/device/v2/state/events`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ eventId: stateEventId, kind: 'side_touch' }) });
+  assert.equal((await stateRetry.json()).duplicate, true);
+  const policy = await fetch(`${base}/api/admin/character-state`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-001', revision: 1,
+      timeZone: 'Asia/Shanghai', deepNightLock: true }) });
+  assert.equal(policy.status, 200);
+  assert.equal((await policy.json()).state.policy.deepNightLock, true);
+  const parentInteraction = await fetch(`${base}/api/parent/v1/events`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ eventId: '26328cb2-463b-44b3-95f7-0963893d808d', kind: 'drank',
+      deviceId: 'tank-002' }) });
+  assert.equal(parentInteraction.status, 200);
+  assert.equal((await parentInteraction.json()).state.needs.thirst, 0);
+  const otherState = await fetch(`${base}/api/admin/character-state?deviceId=tank-002`,
+    { headers: adminHeaders });
+  assert.equal((await otherState.json()).state.needs.thirst, 20,
+    'parent event must update only its paired device');
+  const memoryCreated = await fetch(`${base}/api/admin/approved-memories`, {
+    method: 'POST', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-001', kind: 'preference',
+      subject: 'story_theme', value: '海洋动物' }) });
+  assert.equal(memoryCreated.status, 201);
+  const unauthenticatedMemory = await fetch(`${base}/api/admin/approved-memories?deviceId=tank-001`,
+    { headers: deviceHeaders });
+  assert.equal(unauthenticatedMemory.status, 401);
+  const noCsrfMemory = await fetch(`${base}/api/admin/approved-memories`, {
+    method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ deviceId: 'tank-001', kind: 'preference',
+      subject: 'play_theme', value: '搭积木' }) });
+  assert.equal(noCsrfMemory.status, 403);
+  const approvedMemory = (await memoryCreated.json()).memory;
+  const memoryListed = await fetch(`${base}/api/admin/approved-memories?deviceId=tank-001`,
+    { headers: adminHeaders });
+  assert.equal((await memoryListed.json()).memories[0].value, '海洋动物');
+  const parentMemory = await fetch(`${base}/api/parent/v1/memories`,
+    { headers: parentHeaders });
+  assert.equal((await parentMemory.json()).memories[0].value, '海洋动物');
+  const secondDeviceMemory = await fetch(`${base}/api/admin/approved-memories?deviceId=tank-002`,
+    { headers: adminHeaders });
+  assert.deepEqual((await secondDeviceMemory.json()).memories, []);
+  const memoryDelete = await fetch(`${base}/api/admin/approved-memories?deviceId=tank-001&id=${approvedMemory.id}`,
+    { method: 'DELETE', headers: adminHeaders });
+  assert.equal((await memoryDelete.json()).removed, true);
+  const archivePolicy = await fetch(`${base}/api/admin/question-history`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-001', enabled: true, retentionDays: 7 }) });
+  assert.equal(archivePolicy.status, 200);
+  assert.equal((await archivePolicy.json()).policy.enabled, true);
 
   const configResponse = await fetch(`${base}/api/device/v1/config`, { headers: deviceHeaders });
   assert.equal(configResponse.status, 200);
@@ -199,6 +346,137 @@ test('admin, provider, device and safe OTA flow', async (t) => {
     body: JSON.stringify({ kind: 'tts', provider: 'volcengine', label: 'Volcengine Seed TTS', enabled: true, model: 'seed-tts-2.0',
       credentials: {}, options: { speaker: 'zh_female_vv_uranus_bigtts', audioFormat: 'pcm', sampleRate: '16000' } }) });
   assert.equal(pcmProvider.status, 200);
+  const typedId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73fb';
+  const typedBody = JSON.stringify({ requestId: typedId, text: '今天玩什么？' });
+  const boundedWaitStartedAt = Date.now();
+  const boundedWait = await fetch(
+    `${base}/api/device/v1/text-turns/next?waitMs=100`,
+    { headers: deviceHeaders });
+  const boundedWaitElapsed = Date.now() - boundedWaitStartedAt;
+  assert.equal(boundedWait.status, 204);
+  assert.ok(boundedWaitElapsed >= 75 && boundedWaitElapsed < 1000,
+    `bounded text wait should return promptly, elapsed=${boundedWaitElapsed}ms`);
+  const typedSubmit = await fetch(`${base}/api/parent/v1/text-turns`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: typedBody,
+  });
+  assert.equal(typedSubmit.status, 202,
+    'a paused camera-mode poll must not be mistaken for an offline robot');
+  llmReply = JSON.stringify({ reply: '我们来玩猜谜吧！', emotion: 'happy',
+    intensity: 70, action: null });
+  const typedPoll = await fetch(`${base}/api/device/v1/text-turns/next?wait=0`,
+    { headers: deviceHeaders });
+  assert.equal((await typedPoll.json()).id, typedId);
+  const typedFollowupId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73fa';
+  const typedFollowup = await fetch(`${base}/api/parent/v1/text-turns`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId: typedFollowupId, text: '再说一句' }),
+  });
+  assert.equal(typedFollowup.status, 202,
+    'an active turn must queue, not reject, a new App or sketch request');
+  const prematureFollowupClaim = await fetch(
+    `${base}/api/device/v1/text-turns/next?wait=0`, { headers: deviceHeaders });
+  assert.equal(prematureFollowupClaim.status, 204,
+    'the device must still execute queued turns serially');
+  const typedDuplicate = await fetch(`${base}/api/parent/v1/text-turns`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: typedBody,
+  });
+  assert.equal(typedDuplicate.status, 200, 'retries must not replay an AI turn');
+  const asrBeforeTyped = asrAudioBytes;
+  const typedConversation = await fetch(`${base}/api/device/v1/conversation/text?jobId=${typedId}&wire=framed-v1&vision=always`, {
+    method: 'POST', headers: deviceHeaders,
+  });
+  assert.equal(typedConversation.status, 200);
+  assert.equal(typedConversation.headers.get('x-ai-action-type'), 'none');
+  await typedConversation.arrayBuffer();
+  assert.equal(asrAudioBytes, asrBeforeTyped, 'text turn must skip microphone and ASR');
+  const typedMetricsDb = new DatabaseSync(config.dbPath);
+  const typedMetricsRow = typedMetricsDb.prepare(
+    'SELECT metrics_json FROM conversation_metrics ORDER BY id DESC LIMIT 1').get();
+  typedMetricsDb.close();
+  const typedMetrics = JSON.parse(typedMetricsRow.metrics_json);
+  assert.equal(typedMetrics.kind, 'text');
+  assert.ok(typedMetrics.textQueueMs >= 0);
+  assert.ok(typedMetrics.textClaimToRequestMs >= 0);
+  const typedReply = await fetch(`${base}/api/parent/v1/text-turns/${typedId}`,
+    { headers: parentHeaders });
+  assert.equal((await typedReply.json()).reply, '我们来玩猜谜吧！');
+  const typedAfterReplyId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73f9';
+  const typedAfterReply = await fetch(`${base}/api/parent/v1/text-turns`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId: typedAfterReplyId, text: '还要再说一句' }),
+  });
+  assert.equal(typedAfterReply.status, 202,
+    'reply_ready must not block a new App or sketch request when its completion ack is lost');
+  const typedDone = await fetch(`${base}/api/device/v1/text-turns/${typedId}/complete`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ status: 'completed' }),
+  });
+  assert.equal(typedDone.status, 200);
+  assert.equal((await (await fetch(`${base}/api/parent/v1/text-turns/${typedId}`,
+    { headers: parentHeaders })).json()).status, 'completed');
+  const typedFollowupClaim = await fetch(
+    `${base}/api/device/v1/text-turns/next?wait=0`, { headers: deviceHeaders });
+  assert.equal((await typedFollowupClaim.json()).id, typedFollowupId);
+  const typedFollowupDone = await fetch(
+    `${base}/api/device/v1/text-turns/${typedFollowupId}/complete`, {
+      method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked' }),
+    });
+  assert.equal(typedFollowupDone.status, 200);
+  const typedAfterReplyClaim = await fetch(
+    `${base}/api/device/v1/text-turns/next?wait=0`, { headers: deviceHeaders });
+  assert.equal((await typedAfterReplyClaim.json()).id, typedAfterReplyId,
+    'queued turns must preserve FIFO order');
+  const typedAfterReplyDone = await fetch(
+    `${base}/api/device/v1/text-turns/${typedAfterReplyId}/complete`, {
+      method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked' }),
+    });
+  assert.equal(typedAfterReplyDone.status, 200);
+
+  const sketchId = 'f3555ed4-b076-4863-90e3-36f3873acf0d';
+  const sketchJpeg = await sharp({
+    create: { width: 384, height: 384, channels: 3, background: '#fffdf7' },
+  }).composite([{
+    input: Buffer.from('<svg width="384" height="384"><path d="M70 300 L192 70 L314 300 Z" fill="none" stroke="#17242d" stroke-width="22" stroke-linejoin="round"/></svg>'),
+    top: 0, left: 0,
+  }]).jpeg({ quality: 88 }).toBuffer();
+  visionReply = JSON.stringify({ guess: '小飞机' });
+  const llmBeforeSketch = llmRequests.length;
+  const sketchSubmit = await fetch(`${base}/api/parent/v1/sketch-guesses`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId: sketchId, round: 1,
+      jpegBase64: sketchJpeg.toString('base64') }),
+  });
+  assert.equal(sketchSubmit.status, 202);
+  const sketchQueued = await sketchSubmit.json();
+  assert.equal(sketchQueued.guess, '小飞机');
+  assert.equal(sketchQueued.reply, '我猜这是小飞机！');
+  const sketchPoll = await fetch(`${base}/api/device/v1/text-turns/next?wait=0`,
+    { headers: deviceHeaders });
+  assert.equal((await sketchPoll.json()).id, sketchId);
+  const sketchConversation = await fetch(
+    `${base}/api/device/v1/conversation/text?jobId=${sketchId}&wire=framed-v1`, {
+      method: 'POST', headers: deviceHeaders,
+    });
+  assert.equal(sketchConversation.status, 200);
+  assert.equal(sketchConversation.headers.get('x-ai-action-type'), 'none');
+  assert.equal(Buffer.from(await sketchConversation.arrayBuffer())[0], 0x50);
+  assert.equal(ttsRequest.req_params.text, '我猜这是小飞机！');
+  assert.equal(llmRequests.length, llmBeforeSketch,
+    'guess playback must not trigger a second language-model request');
+  const sketchDone = await fetch(`${base}/api/device/v1/text-turns/${sketchId}/complete`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ status: 'completed' }),
+  });
+  assert.equal(sketchDone.status, 200);
+  const sketchFinal = await (await fetch(`${base}/api/parent/v1/text-turns/${sketchId}`,
+    { headers: parentHeaders })).json();
+  assert.equal(sketchFinal.status, 'completed');
+  assert.equal(sketchFinal.reply, '我猜这是小飞机！');
+  llmReply = '你好';
   const conversation = await fetch(`${base}/api/device/v1/conversation?format=pcm&sampleRate=16000&curiosity=61&warmth=72&talkativeness=35`, {
     method: 'POST', headers: { ...deviceHeaders, 'content-type': 'audio/pcm' }, body: audio,
   });
@@ -214,12 +492,27 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(conversation.headers.get('x-turn-pcm-duration-ms'), '0');
   assert.match(conversation.headers.get('x-turn-trace-id'), /^[0-9a-f-]{36}$/);
   assert.equal(Buffer.from(await conversation.arrayBuffer()).toString(), 'mock-audio');
+  const questionHistory = await fetch(`${base}/api/admin/question-history?deviceId=tank-001`,
+    { headers: adminHeaders });
+  assert.equal(questionHistory.status, 200);
+  const questionPage = await questionHistory.json();
+  assert.equal(questionPage.questions[0].question, '测试成功');
+  assert.equal(questionPage.questions[0].answer, '你好');
+  const archiveOff = await fetch(`${base}/api/admin/question-history`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({ deviceId: 'tank-001', enabled: false, retentionDays: 7 }) });
+  assert.equal(archiveOff.status, 200);
+  const afterOptOut = await fetch(`${base}/api/admin/question-history?deviceId=tank-001`,
+    { headers: adminHeaders });
+  assert.deepEqual((await afterOptOut.json()).questions, []);
   const moodState = await fetch(`${base}/api/device/v1/mood`, {
     headers: deviceHeaders,
   });
   assert.equal(moodState.status, 200);
   const moodBody = await moodState.json();
   assert.equal(moodBody.version, 1);
+  assert.match(moodBody.band,
+    /^(morning|midday|afternoon|early_evening|evening|late_night)$/);
   assert.equal(moodBody.thought.key, 'cloud');
   assert.equal(moodBody.thought.text, '小云朵慢慢飘过来啦');
   assert.equal(moodBody.thought.displayText, '软绵绵');
@@ -228,7 +521,7 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   });
   assert.equal(adminMood.status, 200);
   assert.equal((await adminMood.json()).events[0].source, 'speech');
-  assert.match(llmRequests.at(-1).messages[1].content, /好奇心=61，亲近感=72，话语量=35/);
+  assert.match(llmRequests.at(-1).messages[1].content, /好奇心=78，亲近感=84，话语量=46/);
   assert.equal(llmRequests.at(-1).messages.at(-1).content, '测试成功');
   assert.equal(ttsRequest.req_params.audio_params.format, 'pcm');
 
@@ -340,6 +633,14 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(expressive.headers.get('x-ai-emotion'), 'curious');
   assert.equal(expressive.headers.get('x-ai-face-cues'), '0:curious:60,5:happy:80');
   assert.equal(Buffer.from(await expressive.arrayBuffer()).toString(), 'mock-audiomock-audio');
+  const afterExpressiveMood = await fetch(`${base}/api/device/v1/mood`, {
+    headers: deviceHeaders,
+  });
+  assert.equal(afterExpressiveMood.status, 200);
+  const afterExpressiveMoodBody = await afterExpressiveMood.json();
+  assert.equal(afterExpressiveMoodBody.mood.label, moodBody.mood.label,
+    'sentence emotion must not overwrite the needs-derived long-term mood');
+  assert.equal(afterExpressiveMoodBody.mood.valence, moodBody.mood.valence);
   llmReply = JSON.stringify({ reply: '咦？真漂亮！', emotion: 'calm', intensity: 50,
     action: null });
   const planned = await fetch(`${base}/api/device/v1/conversation?format=pcm&sampleRate=16000&diagnostic=1`, {
@@ -439,13 +740,16 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(touchConversation.status, 200);
   await touchConversation.arrayBuffer();
   assert.match(llmRequests.at(-1).messages.at(-1).content, /左侧轻轻摸了你一下/);
-  assert.equal(llmRequests.at(-1).messages.filter((item) => item.role === 'assistant').length, 6);
+  assert.equal(llmRequests.at(-1).messages.filter((item) => item.role === 'assistant').length, 7);
 
   asrText = '画个小汽车';
-  const curatedDrawing = { durationMs: 6000, items: [
-    { emoji: '🚗', x: 120, y: 120, size: 188, rotation: 0, flipX: false },
-  ] };
-  drawingProposalReply = JSON.stringify({ drawing: curatedDrawing });
+  const modelDrawing = { durationMs: 15000,
+    svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">' +
+      '<rect x="0" y="0" width="240" height="240" fill="#071018"/>' +
+      '<rect x="40" y="95" width="160" height="70" rx="16" fill="#59f3e8"/>' +
+      '<circle cx="78" cy="172" r="20" fill="#fff1c7"/>' +
+      '<circle cx="162" cy="172" r="20" fill="#fff1c7"/></svg>' };
+  drawingProposalReply = JSON.stringify({ drawing: modelDrawing });
   llmReply = JSON.stringify({ reply: '给你画一辆小汽车。', emotion: 'happy',
     intensity: 70, action: null, camera: null, drawing: null });
   const drawReply = await fetch(`${base}/api/device/v1/conversation/stream?format=pcm&sampleRate=16000&wire=framed-v1`, {
@@ -461,7 +765,7 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   });
   assert.equal(drawing.status, 200);
   assert.equal(drawing.headers.get('content-type'), 'image/jpeg');
-  assert.equal(drawing.headers.get('x-drawing-duration-ms'), '6000');
+  assert.equal(drawing.headers.get('x-drawing-duration-ms'), '15000');
   const drawingJpeg = Buffer.from(await drawing.arrayBuffer());
   assert.deepEqual([...drawingJpeg.subarray(0, 2)], [0xff, 0xd8]);
   const drawingReplay = await fetch(`${base}/api/device/v1/drawing?traceId=${drawTrace}`,
@@ -471,7 +775,7 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(drawingAudit.prepare('SELECT COUNT(*) AS count FROM ai_action_execution WHERE trace_id=?')
     .get(drawTrace).count, 0, 'drawing must not authorize motion');
   drawingAudit.close();
-  drawingProposalReply = JSON.stringify({ drawing: curatedDrawing });
+  drawingProposalReply = JSON.stringify({ drawing: modelDrawing });
   llmReply = JSON.stringify({ reply: '给你画自行车。', emotion: 'happy',
     intensity: 70, action: null, drawing: null });
   asrText = '画辆自行车';
@@ -503,6 +807,23 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   assert.equal(autonomousScene.status, 200);
   assert.equal(autonomousScene.headers.get('content-type'), 'image/jpeg');
   assert.ok((await autonomousScene.arrayBuffer()).byteLength > 256);
+  asrText = '画个小汽车';
+  llmReply = JSON.stringify({ reply: '再画一辆。', emotion: 'happy',
+    intensity: 70, action: null, camera: null, drawing: null });
+  drawingProposalReplies = [JSON.stringify({ drawing: { durationMs: 15000,
+    items: [{ emoji: '🚗', x: 120, y: 120 }] } }),
+  JSON.stringify({ drawing: modelDrawing })];
+  const beforeRepair = llmRequests.length;
+  const repairedDrawing = await fetch(`${base}/api/device/v1/conversation/stream?format=pcm&sampleRate=16000&wire=framed-v1`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'audio/pcm' }, body: audio,
+  });
+  assert.equal(repairedDrawing.status, 200);
+  assert.equal(repairedDrawing.headers.get('x-ai-action-type'), 'draw');
+  await repairedDrawing.arrayBuffer();
+  assert.equal(llmRequests.slice(beforeRepair).filter((request) =>
+    request.messages[0]?.content.includes('儿童矢量插画的画师')).length, 2,
+  'one invalid drawing may be repaired once, without emoji fallback');
+  drawingProposalReplies = null;
   drawingProposalReply = null;
   asrText = '测试成功';
   llmReply = '你好';
@@ -586,9 +907,9 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   const deterministicDrive = await fetch(`${base}/api/device/v1/conversation?format=pcm&sampleRate=16000`, {
     method: 'POST', headers: { ...deviceHeaders, 'content-type': 'audio/pcm' }, body: audio,
   });
-  assert.equal(deterministicDrive.headers.get('x-ai-action-mode'), 'execute');
-  assert.equal(deterministicDrive.headers.get('x-ai-action-direction'), 'forward');
-  assert.equal(deterministicDrive.headers.get('x-ai-action-duration-ms'), '2000');
+  assert.equal(deterministicDrive.headers.get('x-ai-action-mode'), 'shadow');
+  assert.equal(deterministicDrive.headers.get('x-ai-action-direction'), null);
+  assert.equal(deterministicDrive.headers.get('x-ai-action-duration-ms'), null);
   await deterministicDrive.arrayBuffer();
   asrText = '为什么不能前进';
   llmReply = JSON.stringify({ reply: '我们先聊聊', action: {
@@ -596,10 +917,16 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   const indirect = await fetch(`${base}/api/device/v1/conversation?format=pcm&sampleRate=16000`, {
     method: 'POST', headers: { ...deviceHeaders, 'content-type': 'audio/pcm' }, body: audio,
   });
-  assert.equal(indirect.headers.get('x-ai-action-mode'), 'execute');
-  assert.equal(indirect.headers.get('x-ai-action-status'), 'approved');
-  assert.equal(indirect.headers.get('x-ai-action-direction'), 'forward');
+  assert.equal(indirect.headers.get('x-ai-action-mode'), 'shadow');
+  assert.equal(indirect.headers.get('x-ai-action-status'), 'rejected');
+  assert.equal(indirect.headers.get('x-ai-action-type'), 'none');
+  assert.equal(indirect.headers.get('x-ai-action-direction'), null);
   await indirect.arrayBuffer();
+  const indirectAudit = new DatabaseSync(config.dbPath);
+  assert.equal(indirectAudit.prepare('SELECT COUNT(*) AS count FROM ai_action_execution WHERE trace_id=?')
+    .get(indirect.headers.get('x-turn-trace-id')).count, 0,
+  'a question about movement must not create a motor authorization');
+  indirectAudit.close();
 
   llmReply = JSON.stringify({ reply: '先不动', action: { type: 'drive', direction: 'forward', speed: 1000 } });
   const invalidDrive = await fetch(`${base}/api/device/v1/conversation?format=pcm&sampleRate=16000&diagnostic=1`, {
@@ -666,7 +993,7 @@ test('admin, provider, device and safe OTA flow', async (t) => {
     method: 'POST', headers: deviceHeaders,
   });
   assert.equal(touchCannotDrive.status, 200);
-  assert.equal(touchCannotDrive.headers.get('x-ai-action-status'), 'rejected');
+  assert.equal(touchCannotDrive.headers.get('x-ai-action-status'), 'none');
   await touchCannotDrive.arrayBuffer();
   llmReply = '你好';
 
@@ -679,6 +1006,15 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   const release = await upload.json();
   const publish = await fetch(`${base}/api/admin/firmware/${release.id}/publish`, { method: 'POST', headers: adminHeaders, body: '{}' });
   assert.equal(publish.status, 200);
+
+  const publicReleases = await fetch(`${base}/api/public/v1/releases`);
+  const publicRelease = (await publicReleases.json()).releases[0];
+  assert.equal(publicRelease.version, '1.2.3');
+  assert.equal(publicRelease.board, 'baby-tank-s3');
+  assert.equal(publicRelease.downloadUrl, `/api/public/v1/releases/${release.id}/download`);
+  const publicDownload = await fetch(`${base}${publicRelease.downloadUrl}`, { headers: { range: 'bytes=0-15' } });
+  assert.equal(publicDownload.status, 206);
+  assert.equal((await publicDownload.arrayBuffer()).byteLength, 16);
 
   const noSecureBoot = await fetch(`${base}/api/device/v1/ota/check?version=1.0.0&chip=esp32s3&secureVersion=1`, { headers: deviceHeaders });
   assert.deepEqual(await noSecureBoot.json(), { updateAvailable: false });
@@ -714,12 +1050,25 @@ test('admin, provider, device and safe OTA flow', async (t) => {
   asrText = '今天想玩什么';
   llmReply = JSON.stringify({ reply: '我们玩猜谜。', emotion: 'happy', intensity: 70,
     camera: null, action: null });
+  const staleIdleSocket = new WebSocket(
+    `ws://127.0.0.1:${server.address().port}/api/device/v1/conversation/ws`,
+    { headers: deviceHeaders });
+  await once(staleIdleSocket, 'open');
+  const staleClosed = once(staleIdleSocket, 'close');
+  const replacementSocket = new WebSocket(
+    `ws://127.0.0.1:${server.address().port}/api/device/v1/conversation/ws`,
+    { headers: deviceHeaders });
+  await once(replacementSocket, 'open');
+  await staleClosed;
+  replacementSocket.close();
+  await once(replacementSocket, 'close');
   const voiceSocket = new WebSocket(`ws://127.0.0.1:${server.address().port}/api/device/v1/conversation/ws`,
     { headers: deviceHeaders });
   await once(voiceSocket, 'open');
   const asrBytesBeforeSocket = asrAudioBytes;
-  async function websocketVoiceTurn() {
+  async function websocketVoiceTurn(packet = audio) {
     const received = [];
+    let replyHeaders = null;
     const finished = new Promise((resolve, reject) => {
       const onMessage = (payload, binary) => {
         if (binary) {
@@ -733,25 +1082,157 @@ test('admin, provider, device and safe OTA flow', async (t) => {
         } else if (message.type === 'reply') {
           assert.equal(message.status, 200);
           assert.equal(message.headers['x-babytank-audio-framing'], 'v1');
+          replyHeaders = message.headers;
         } else if (message.type === 'turn_end') {
           voiceSocket.off('message', onMessage);
-          resolve(Buffer.concat(received));
+          resolve({ audio: Buffer.concat(received), headers: replyHeaders });
         }
       };
       voiceSocket.on('message', onMessage);
     });
     voiceSocket.send(JSON.stringify({ type: 'listen', state: 'start',
       curiosity: 78, warmth: 84, talkativeness: 46 }));
-    voiceSocket.send(audio, { binary: true });
+    voiceSocket.send(packet, { binary: true });
     voiceSocket.send(JSON.stringify({ type: 'listen', state: 'stop' }));
     return finished;
   }
-  const firstSocketTurn = await websocketVoiceTurn();
+  const batchedPcm = Buffer.concat([audio, audio, audio]).subarray(0, 8_000);
+  const firstSocketTurn = await websocketVoiceTurn(batchedPcm);
   const secondSocketTurn = await websocketVoiceTurn();
-  assert.equal(firstSocketTurn[0], 0x50);
-  assert.equal(secondSocketTurn[0], 0x50);
-  assert.equal(asrAudioBytes - asrBytesBeforeSocket, audio.length * 2,
-    'two turns must share one authenticated WebSocket without losing microphone frames');
+  assert.equal(firstSocketTurn.audio[0], 0x50);
+  assert.equal(secondSocketTurn.audio[0], 0x50);
+  assert.equal(asrAudioBytes - asrBytesBeforeSocket, batchedPcm.length + audio.length,
+    'a batched PCM frame and the following turn must share one authenticated WebSocket without losing microphone frames');
+
+  asrText = '往后退一步';
+  llmReply = JSON.stringify({ reply: '好，往后走一点。', emotion: 'calm',
+    action: null });
+  driveRouterReply = JSON.stringify({ action: { type: 'drive', direction: 'backward',
+    durationMs: 2000 } });
+  const socketDrive = await websocketVoiceTurn();
+  assert.equal(socketDrive.headers['x-ai-action-version'], '4');
+  assert.equal(socketDrive.headers['x-ai-action-mode'], 'execute');
+  assert.equal(socketDrive.headers['x-ai-action-status'], 'approved');
+  assert.equal(socketDrive.headers['x-ai-action-direction'], 'backward');
+  assert.equal(socketDrive.headers['x-ai-action-duration-ms'], '2000');
+  assert.equal(socketDrive.audio[0], 0x50);
+  driveRouterReply = null;
+
+  asrText = '画个小汽车';
+  llmReply = JSON.stringify({ reply: '给你画辆小汽车。', emotion: 'happy',
+    action: null, camera: null, drawing: null });
+  drawingProposalReply = JSON.stringify({ drawing: modelDrawing });
+  const socketDraw = await websocketVoiceTurn();
+  assert.equal(socketDraw.headers['x-ai-action-version'], '6');
+  assert.equal(socketDraw.headers['x-ai-action-type'], 'draw');
+  assert.equal(socketDraw.headers['x-ai-action-status'], 'approved');
+  assert.equal(socketDraw.audio[0], 0x50);
+  const socketDrawing = await fetch(`${base}/api/device/v1/drawing?traceId=${
+    socketDraw.headers['x-turn-trace-id']}`, { headers: deviceHeaders });
+  assert.equal(socketDrawing.status, 200);
+  assert.equal(socketDrawing.headers.get('x-drawing-duration-ms'), '15000');
+  assert.deepEqual([...Buffer.from(await socketDrawing.arrayBuffer()).subarray(0, 2)],
+    [0xff, 0xd8]);
+  const socketTextId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73e0';
+  const textAvailable = new Promise((resolve) => {
+    const onMessage = (payload, binary) => {
+      if (binary) return;
+      const message = JSON.parse(String(payload));
+      if (message.type !== 'text_available') return;
+      voiceSocket.off('message', onMessage);
+      resolve(message);
+    };
+    voiceSocket.on('message', onMessage);
+  });
+  const socketTextSubmit = await fetch(`${base}/api/parent/v1/text-turns`, {
+    method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId: socketTextId, text: '讲个小故事' }),
+  });
+  assert.equal(socketTextSubmit.status, 202);
+  const textNotice = await textAvailable;
+  assert.equal(textNotice.type, 'text_available');
+  assert.equal(textNotice.id, socketTextId);
+  llmReply = JSON.stringify({ reply: '从前有一辆勇敢的小坦克。',
+    emotion: 'happy', action: null, camera: null });
+  const textAudio = [];
+  const socketTextFinished = new Promise((resolve, reject) => {
+    const onMessage = (payload, binary) => {
+      if (binary) { textAudio.push(Buffer.from(payload)); return; }
+      const message = JSON.parse(String(payload));
+      if (message.type === 'turn_error') {
+        voiceSocket.off('message', onMessage);
+        reject(new Error(`${message.status}: ${message.code}`));
+      } else if (message.type === 'turn_end') {
+        voiceSocket.off('message', onMessage);
+        resolve();
+      }
+    };
+    voiceSocket.on('message', onMessage);
+  });
+  voiceSocket.send(JSON.stringify({ type: 'text', state: 'start',
+    jobId: socketTextId }));
+  await socketTextFinished;
+  assert.equal(Buffer.concat(textAudio)[0], 0x50);
+  const socketTextBlocked = await fetch(
+    `${base}/api/device/v1/text-turns/${socketTextId}/complete`, {
+      method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked' }),
+    });
+  assert.equal(socketTextBlocked.status, 200);
   voiceSocket.close();
   await once(voiceSocket, 'close');
+
+  async function claimTypedTurn(id, text) {
+    const idlePoll = await fetch(`${base}/api/device/v1/text-turns/next?wait=0`,
+      { headers: deviceHeaders });
+    assert.equal(idlePoll.status, 204);
+    const submitted = await fetch(`${base}/api/parent/v1/text-turns`, {
+      method: 'POST', headers: { ...parentHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ requestId: id, text }),
+    });
+    assert.equal(submitted.status, 202);
+    const claimed = await fetch(`${base}/api/device/v1/text-turns/next?wait=0`,
+      { headers: deviceHeaders });
+    assert.equal((await claimed.json()).id, id);
+  }
+  async function completeTypedTurn(id) {
+    const completed = await fetch(`${base}/api/device/v1/text-turns/${id}/complete`, {
+      method: 'POST', headers: { ...deviceHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'completed' }),
+    });
+    assert.equal(completed.status, 200);
+  }
+  const typedLookId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73fc';
+  await claimTypedTurn(typedLookId, '看看眼前是什么');
+  const typedLook = await fetch(`${base}/api/device/v1/conversation/text?jobId=${typedLookId}&wire=framed-v1&vision=always`, {
+    method: 'POST', headers: deviceHeaders,
+  });
+  assert.equal(typedLook.status, 200);
+  assert.equal(typedLook.headers.get('x-ai-action-type'), 'look');
+  const typedLookTrace = typedLook.headers.get('x-turn-trace-id');
+  await typedLook.arrayBuffer();
+  visionReply = JSON.stringify({ reply: '眼前有一张桌子。', emotion: 'curious',
+    intensity: 60, action: null });
+  const typedPhotoAnswer = await fetch(`${base}/api/device/v1/vision/describe?traceId=${typedLookTrace}`, {
+    method: 'POST', headers: { ...deviceHeaders, 'content-type': 'image/jpeg' },
+    body: lookJpeg,
+  });
+  assert.equal(typedPhotoAnswer.status, 200);
+  await typedPhotoAnswer.arrayBuffer();
+  assert.equal((await (await fetch(`${base}/api/parent/v1/text-turns/${typedLookId}`,
+    { headers: parentHeaders })).json()).reply, '眼前有一张桌子。');
+  await completeTypedTurn(typedLookId);
+
+  const typedDriveId = 'dd617c68-093b-4b63-9a5b-a44fbd5f73fd';
+  await claimTypedTurn(typedDriveId, '往后走一点');
+  llmReply = JSON.stringify({ reply: '好，往后走一点。', emotion: 'calm',
+    action: { type: 'drive', direction: 'backward', durationMs: 2000 } });
+  const typedDrive = await fetch(`${base}/api/device/v1/conversation/text?jobId=${typedDriveId}&wire=framed-v1&vision=always`, {
+    method: 'POST', headers: deviceHeaders,
+  });
+  assert.equal(typedDrive.status, 200);
+  assert.equal(typedDrive.headers.get('x-ai-action-direction'), 'backward');
+  assert.equal(typedDrive.headers.get('x-ai-action-duration-ms'), '2000');
+  await typedDrive.arrayBuffer();
+  await completeTypedTurn(typedDriveId);
 });

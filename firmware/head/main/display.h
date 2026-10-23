@@ -76,10 +76,31 @@ typedef enum {
     BABY_TANK_THOUGHT_BUBBLE,
     BABY_TANK_THOUGHT_QUESTION,
     BABY_TANK_THOUGHT_MUSIC,
+    BABY_TANK_THOUGHT_BIRD,
+    BABY_TANK_THOUGHT_BOOK,
+    BABY_TANK_THOUGHT_KITE,
 } baby_tank_thought_t;
+
+#define BABY_TANK_DREAM_DECK_CAPACITY 30U
+typedef struct {
+    baby_tank_thought_t thought;
+    uint8_t glyph_count;
+    uint8_t glyphs[4];
+} baby_tank_dream_entry_t;
+
+typedef enum {
+    BABY_TANK_SCENE_EXERCISE = 0,
+    BABY_TANK_SCENE_READING,
+    BABY_TANK_SCENE_BLOCKS,
+    BABY_TANK_SCENE_EXPLORE,
+    BABY_TANK_SCENE_CLOUDS,
+    BABY_TANK_SCENE_TIDY,
+    BABY_TANK_SCENE_COUNT,
+} baby_tank_scene_t;
 
 #define BABY_TANK_DRAWING_WIDTH 240U
 #define BABY_TANK_DRAWING_HEIGHT 240U
+#define BABY_TANK_DRAWING_MAX_DURATION_MS 15000U
 typedef struct {
     uint16_t duration_ms;
     uint16_t width;
@@ -95,9 +116,16 @@ esp_err_t baby_tank_display_render_expression(baby_tank_expression_t expression,
                                               uint8_t intensity,
                                               uint8_t speech_level);
 esp_err_t baby_tank_display_render_drawing(const baby_tank_drawing_t *drawing);
+esp_err_t baby_tank_display_render_scene(baby_tank_scene_t scene,
+                                         uint32_t elapsed_ms);
 esp_err_t baby_tank_display_set_sleep_thought(baby_tank_thought_t thought);
 /* Updates the 2-4 character, cloud-generated sleep caption. */
 esp_err_t baby_tank_display_set_sleep_text(const char *utf8_text);
+esp_err_t baby_tank_display_make_dream_entry(const char *key,
+                                             const char *utf8_text,
+                                             baby_tank_dream_entry_t *entry);
+esp_err_t baby_tank_display_set_dream_deck(
+    const baby_tank_dream_entry_t *entries, size_t count);
 
 /* Temporarily directs both eyes toward a normalized -100..100 target. */
 esp_err_t baby_tank_display_look_at(int8_t horizontal,

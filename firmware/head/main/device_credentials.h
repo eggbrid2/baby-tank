@@ -1,11 +1,13 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
 #define BABY_TANK_WIFI_SSID_CAPACITY 33U
 #define BABY_TANK_WIFI_PASSWORD_CAPACITY 65U
+#define BABY_TANK_WIFI_PROFILE_MAX 4U
 #define BABY_TANK_DEVICE_TOKEN_CAPACITY 192U
 #define BABY_TANK_SETUP_POP_CAPACITY 65U
 
@@ -15,6 +17,11 @@ typedef struct {
     char device_token[BABY_TANK_DEVICE_TOKEN_CAPACITY];
     char setup_pop[BABY_TANK_SETUP_POP_CAPACITY];
 } baby_tank_device_credentials_t;
+
+typedef struct {
+    char ssid[BABY_TANK_WIFI_SSID_CAPACITY];
+    char password[BABY_TANK_WIFI_PASSWORD_CAPACITY];
+} baby_tank_wifi_profile_t;
 
 /* Credentials live only in NVS. They are never supplied through sdkconfig. */
 esp_err_t baby_tank_device_credentials_load(
@@ -28,6 +35,10 @@ esp_err_t baby_tank_wifi_credentials_load(
     baby_tank_device_credentials_t *credentials);
 esp_err_t baby_tank_wifi_credentials_store(
     const char *ssid, const char *password);
+/* Most recently provisioned network first; legacy single-network NVS is
+ * migrated lazily without discarding it. Never log returned passwords. */
+esp_err_t baby_tank_wifi_profiles_load(baby_tank_wifi_profile_t *profiles,
+                                      size_t capacity, size_t *count);
 
 /* Provisioning UI may call this later; current firmware never logs the values. */
 esp_err_t baby_tank_device_credentials_store(

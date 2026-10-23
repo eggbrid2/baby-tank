@@ -50,13 +50,15 @@ static portMUX_TYPE s_thought_lock = portMUX_INITIALIZER_UNLOCKED;
 static baby_tank_thought_t s_sleep_thought = BABY_TANK_THOUGHT_CLOUD;
 static uint8_t s_sleep_glyphs[4] = {6U, 7U, 7U, UINT8_MAX};
 static size_t s_sleep_glyph_count = 3U;
+static baby_tank_dream_entry_t s_dream_deck[BABY_TANK_DREAM_DECK_CAPACITY];
+static size_t s_dream_deck_count;
 static size_t thought_caption_count(baby_tank_thought_t thought);
 static void set_sleep_glyphs_for_thought(baby_tank_thought_t thought);
 
 esp_err_t baby_tank_display_set_sleep_thought(baby_tank_thought_t thought)
 {
     ESP_RETURN_ON_FALSE(thought >= BABY_TANK_THOUGHT_NONE &&
-                            thought <= BABY_TANK_THOUGHT_MUSIC,
+                            thought <= BABY_TANK_THOUGHT_KITE,
                         ESP_ERR_INVALID_ARG, TAG, "invalid thought icon");
     taskENTER_CRITICAL(&s_thought_lock);
     s_sleep_thought = thought;
@@ -296,6 +298,9 @@ static const uint8_t s_thought_captions[][4] = {
     [BABY_TANK_THOUGHT_BUBBLE] = {23, 24, 24, UINT8_MAX},
     [BABY_TANK_THOUGHT_QUESTION] = {8, 19, 8, UINT8_MAX},
     [BABY_TANK_THOUGHT_MUSIC] = {25, 20, 26, UINT8_MAX},
+    [BABY_TANK_THOUGHT_BIRD] = {16, 13, 17, UINT8_MAX},
+    [BABY_TANK_THOUGHT_BOOK] = {8, 19, 8, UINT8_MAX},
+    [BABY_TANK_THOUGHT_KITE] = {13, 14, 15, UINT8_MAX},
 };
 
 static const uint16_t s_thought_codepoints[] = {
@@ -343,22 +348,46 @@ static bool next_utf8_codepoint(const char **cursor, uint32_t *codepoint)
     return false;
 }
 
-esp_err_t baby_tank_display_set_sleep_text(const char *utf8_text)
+static baby_tank_thought_t thought_from_key(const char *key)
 {
-    ESP_RETURN_ON_FALSE(utf8_text != NULL, ESP_ERR_INVALID_ARG, TAG,
-                        "sleep text is required");
-    uint8_t glyphs[4] = {UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX};
+    static const struct {
+        const char *key;
+        baby_tank_thought_t thought;
+    } values[] = {
+        {"star", BABY_TANK_THOUGHT_STAR}, {"moon", BABY_TANK_THOUGHT_MOON},
+        {"cloud", BABY_TANK_THOUGHT_CLOUD}, {"heart", BABY_TANK_THOUGHT_HEART},
+        {"flower", BABY_TANK_THOUGHT_FLOWER}, {"rocket", BABY_TANK_THOUGHT_ROCKET},
+        {"car", BABY_TANK_THOUGHT_CAR}, {"ball", BABY_TANK_THOUGHT_BALL},
+        {"fish", BABY_TANK_THOUGHT_FISH}, {"bubble", BABY_TANK_THOUGHT_BUBBLE},
+        {"question", BABY_TANK_THOUGHT_QUESTION}, {"music", BABY_TANK_THOUGHT_MUSIC},
+        {"bird", BABY_TANK_THOUGHT_BIRD}, {"book", BABY_TANK_THOUGHT_BOOK},
+        {"kite", BABY_TANK_THOUGHT_KITE},
+    };
+    if (key == NULL) return BABY_TANK_THOUGHT_NONE;
+    for (size_t index = 0U; index < sizeof(values) / sizeof(values[0]); ++index) {
+        if (strcmp(values[index].key, key) == 0) return values[index].thought;
+    }
+    return BABY_TANK_THOUGHT_NONE;
+}
+
+static esp_err_t glyphs_from_text(const char *utf8_text, uint8_t glyphs[4],
+                                  uint8_t *glyph_count)
+{
+    ESP_RETURN_ON_FALSE(utf8_text != NULL && glyphs != NULL &&
+                            glyph_count != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "dream text is required");
+    memset(glyphs, UINT8_MAX, 4U);
     size_t count = 0U;
     const char *cursor = utf8_text;
     while (*cursor != '\0') {
         ESP_RETURN_ON_FALSE(count < 4U, ESP_ERR_INVALID_SIZE, TAG,
-                            "sleep text exceeds four characters");
+                            "dream text exceeds four characters");
         uint32_t codepoint = 0U;
         const char *before = cursor;
         ESP_RETURN_ON_FALSE(next_utf8_codepoint(&cursor, &codepoint) &&
                                 cursor > before,
                             ESP_ERR_INVALID_ARG, TAG,
-                            "sleep text contains invalid UTF-8");
+                            "dream text contains invalid UTF-8");
         size_t glyph = 0U;
         while (glyph < sizeof(s_thought_codepoints) /
                            sizeof(s_thought_codepoints[0]) &&
@@ -368,11 +397,21 @@ esp_err_t baby_tank_display_set_sleep_text(const char *utf8_text)
         ESP_RETURN_ON_FALSE(glyph < sizeof(s_thought_codepoints) /
                                        sizeof(s_thought_codepoints[0]),
                             ESP_ERR_NOT_SUPPORTED, TAG,
-                            "sleep text glyph is not embedded");
+                            "dream text glyph is not embedded");
         glyphs[count++] = (uint8_t)glyph;
     }
     ESP_RETURN_ON_FALSE(count >= 2U, ESP_ERR_INVALID_SIZE, TAG,
-                        "sleep text needs two to four characters");
+                        "dream text needs two to four characters");
+    *glyph_count = (uint8_t)count;
+    return ESP_OK;
+}
+
+esp_err_t baby_tank_display_set_sleep_text(const char *utf8_text)
+{
+    uint8_t glyphs[4] = {UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX};
+    uint8_t count = 0U;
+    ESP_RETURN_ON_ERROR(glyphs_from_text(utf8_text, glyphs, &count), TAG,
+                        "invalid sleep text");
     taskENTER_CRITICAL(&s_thought_lock);
     memcpy(s_sleep_glyphs, glyphs, sizeof(glyphs));
     s_sleep_glyph_count = count;
@@ -381,10 +420,48 @@ esp_err_t baby_tank_display_set_sleep_text(const char *utf8_text)
     return ESP_OK;
 }
 
+esp_err_t baby_tank_display_make_dream_entry(const char *key,
+                                             const char *utf8_text,
+                                             baby_tank_dream_entry_t *entry)
+{
+    ESP_RETURN_ON_FALSE(entry != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "dream entry output is required");
+    baby_tank_thought_t thought = thought_from_key(key);
+    ESP_RETURN_ON_FALSE(thought != BABY_TANK_THOUGHT_NONE,
+                        ESP_ERR_INVALID_ARG, TAG, "unknown dream icon");
+    baby_tank_dream_entry_t parsed = {.thought = thought};
+    ESP_RETURN_ON_ERROR(glyphs_from_text(utf8_text, parsed.glyphs,
+                                        &parsed.glyph_count),
+                        TAG, "invalid dream caption");
+    *entry = parsed;
+    return ESP_OK;
+}
+
+esp_err_t baby_tank_display_set_dream_deck(
+    const baby_tank_dream_entry_t *entries, size_t count)
+{
+    ESP_RETURN_ON_FALSE(entries != NULL && count > 0U &&
+                            count <= BABY_TANK_DREAM_DECK_CAPACITY,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid dream deck");
+    for (size_t index = 0U; index < count; ++index) {
+        ESP_RETURN_ON_FALSE(entries[index].thought > BABY_TANK_THOUGHT_NONE &&
+                                entries[index].thought <= BABY_TANK_THOUGHT_KITE &&
+                                entries[index].glyph_count >= 2U &&
+                                entries[index].glyph_count <= 4U,
+                            ESP_ERR_INVALID_ARG, TAG, "invalid dream card");
+    }
+    taskENTER_CRITICAL(&s_thought_lock);
+    memcpy(s_dream_deck, entries, count * sizeof(entries[0]));
+    s_dream_deck_count = count;
+    taskEXIT_CRITICAL(&s_thought_lock);
+    ESP_LOGI(TAG, "dream deck activated cards=%u", (unsigned)count);
+    return ESP_OK;
+}
+
 static size_t thought_caption_count(baby_tank_thought_t thought)
 {
     if (thought <= BABY_TANK_THOUGHT_NONE ||
-        thought > BABY_TANK_THOUGHT_MUSIC) return 0U;
+        thought > BABY_TANK_THOUGHT_KITE) return 0U;
     size_t count = 0U;
     while (count < 4U && s_thought_captions[thought][count] != UINT8_MAX) {
         ++count;
@@ -755,9 +832,146 @@ static void draw_travelling_sleep_z(uint32_t phase_ms, uint32_t start_ms,
     draw_sleep_z(x, y, size, thought_alpha_color(color, alpha));
 }
 
+static void draw_dream_icon(baby_tank_thought_t thought, int center_x,
+                            int center_y, int scale, uint32_t animation_ms,
+                            uint16_t ink, uint16_t accent, uint16_t dark)
+{
+    int bob = smooth_wave(animation_ms, 2200U, scale >= 10 ? 2 : 1);
+    int flap = (animation_ms / 260U) % 2U == 0U ? 2 : -1;
+    int s = scale < 6 ? 6 : scale;
+    center_y += bob;
+    switch (thought) {
+    case BABY_TANK_THOUGHT_STAR:
+        fill_circle(center_x, center_y, s / 3, accent);
+        draw_line(center_x - s, center_y, center_x + s, center_y, 1, accent);
+        draw_line(center_x, center_y - s, center_x, center_y + s, 1, accent);
+        draw_line(center_x - s * 2 / 3, center_y - s * 2 / 3,
+                  center_x + s * 2 / 3, center_y + s * 2 / 3, 1, ink);
+        draw_line(center_x + s * 2 / 3, center_y - s * 2 / 3,
+                  center_x - s * 2 / 3, center_y + s * 2 / 3, 1, ink);
+        break;
+    case BABY_TANK_THOUGHT_MOON:
+        fill_circle(center_x, center_y, s, accent);
+        fill_circle(center_x + s / 2, center_y - s / 3, s, dark);
+        break;
+    case BABY_TANK_THOUGHT_CLOUD:
+        fill_circle(center_x - s / 2, center_y, s / 2, ink);
+        fill_circle(center_x, center_y - s / 3, s * 2 / 3, ink);
+        fill_circle(center_x + s / 2, center_y, s / 2, ink);
+        fill_rect(center_x - s, center_y, s * 2, s / 2, ink);
+        break;
+    case BABY_TANK_THOUGHT_HEART:
+        fill_circle(center_x - s / 3, center_y - s / 4, s / 2, accent);
+        fill_circle(center_x + s / 3, center_y - s / 4, s / 2, accent);
+        for (int row = 0; row < s; ++row) {
+            fill_rect(center_x - s + row, center_y - row / 3,
+                      (s - row) * 2, 1, accent);
+        }
+        break;
+    case BABY_TANK_THOUGHT_FLOWER:
+        for (int index = 0; index < 4; ++index) {
+            int dx = index == 0 ? -s / 2 : index == 1 ? s / 2 : 0;
+            int dy = index == 2 ? -s / 2 : index == 3 ? s / 2 : 0;
+            fill_circle(center_x + dx, center_y + dy, s / 2, ink);
+        }
+        fill_circle(center_x, center_y, s / 3, accent);
+        break;
+    case BABY_TANK_THOUGHT_ROCKET:
+        fill_ellipse(center_x, center_y - 1, s / 2, s, ink);
+        fill_circle(center_x, center_y - s / 3, 2, dark);
+        draw_line(center_x - s / 2, center_y + s / 3,
+                  center_x - s, center_y + s, 2, accent);
+        draw_line(center_x + s / 2, center_y + s / 3,
+                  center_x + s, center_y + s, 2, accent);
+        draw_line(center_x, center_y + s, center_x, center_y + s + flap,
+                  2, accent);
+        break;
+    case BABY_TANK_THOUGHT_CAR:
+        fill_rect(center_x - s, center_y - s / 3, s * 2, s, ink);
+        fill_rect(center_x - s / 2, center_y - s, s, s, ink);
+        fill_circle(center_x - s / 2, center_y + s * 2 / 3, s / 3, dark);
+        fill_circle(center_x + s / 2, center_y + s * 2 / 3, s / 3, dark);
+        break;
+    case BABY_TANK_THOUGHT_BALL:
+        fill_circle(center_x, center_y, s, accent);
+        draw_line(center_x - s, center_y, center_x + s, center_y, 1, dark);
+        draw_line(center_x, center_y - s, center_x, center_y + s, 1, dark);
+        break;
+    case BABY_TANK_THOUGHT_FISH:
+        fill_ellipse(center_x, center_y, s, s * 2 / 3, ink);
+        draw_line(center_x - s, center_y, center_x - s * 3 / 2,
+                  center_y - s * 2 / 3 + flap, 2, accent);
+        draw_line(center_x - s, center_y, center_x - s * 3 / 2,
+                  center_y + s * 2 / 3 - flap, 2, accent);
+        fill_circle(center_x + s / 2, center_y - 1, 1, dark);
+        break;
+    case BABY_TANK_THOUGHT_BUBBLE:
+        fill_circle(center_x - s / 2, center_y + s / 3, s / 2, ink);
+        fill_circle(center_x + s / 3, center_y - s / 3, s * 2 / 3, accent);
+        fill_circle(center_x + s, center_y + s / 2, s / 3, ink);
+        break;
+    case BABY_TANK_THOUGHT_QUESTION:
+        draw_line(center_x - s / 2, center_y - s / 2,
+                  center_x, center_y - s, 2, ink);
+        draw_line(center_x, center_y - s, center_x + s / 2,
+                  center_y - s / 2, 2, ink);
+        draw_line(center_x + s / 2, center_y - s / 2,
+                  center_x, center_y + s / 3, 2, ink);
+        fill_circle(center_x, center_y + s, 2, accent);
+        break;
+    case BABY_TANK_THOUGHT_MUSIC:
+        draw_line(center_x, center_y - s, center_x, center_y + s / 2,
+                  2, ink);
+        draw_line(center_x, center_y - s, center_x + s, center_y - s / 2,
+                  2, ink);
+        draw_line(center_x + s, center_y - s / 2,
+                  center_x + s, center_y + s / 2, 2, ink);
+        fill_circle(center_x - 2, center_y + s / 2, s / 3, accent);
+        fill_circle(center_x + s - 2, center_y + s / 2, s / 3, accent);
+        break;
+    case BABY_TANK_THOUGHT_BIRD:
+        fill_ellipse(center_x, center_y, s, s * 2 / 3, ink);
+        draw_line(center_x - s / 2, center_y,
+                  center_x, center_y - s / 2 + flap, 2, accent);
+        draw_line(center_x, center_y - s / 2 + flap,
+                  center_x + s / 3, center_y, 2, accent);
+        draw_line(center_x + s, center_y, center_x + s + 4,
+                  center_y + 2, 1, accent);
+        fill_circle(center_x + s / 2, center_y - 2, 1, dark);
+        break;
+    case BABY_TANK_THOUGHT_BOOK:
+        draw_line(center_x, center_y - s, center_x, center_y + s, 1, ink);
+        draw_line(center_x, center_y - s, center_x - s, center_y - s / 2,
+                  2, ink);
+        draw_line(center_x - s, center_y - s / 2,
+                  center_x - s, center_y + s, 2, ink);
+        draw_line(center_x - s, center_y + s, center_x, center_y + s / 2,
+                  2, ink);
+        draw_line(center_x, center_y - s, center_x + s, center_y - s / 2,
+                  2, accent);
+        draw_line(center_x + s, center_y - s / 2,
+                  center_x + s, center_y + s, 2, accent);
+        draw_line(center_x + s, center_y + s, center_x, center_y + s / 2,
+                  2, accent);
+        break;
+    case BABY_TANK_THOUGHT_KITE:
+        draw_line(center_x, center_y - s, center_x + s, center_y, 2, accent);
+        draw_line(center_x + s, center_y, center_x, center_y + s, 2, accent);
+        draw_line(center_x, center_y + s, center_x - s, center_y, 2, ink);
+        draw_line(center_x - s, center_y, center_x, center_y - s, 2, ink);
+        draw_line(center_x, center_y + s, center_x + flap,
+                  center_y + s * 2, 1, ink);
+        break;
+    default:
+        break;
+    }
+}
+
 static void draw_sleep_dream_story(uint32_t phase_ms,
+                                   baby_tank_thought_t thought,
                                    const uint8_t *glyphs,
                                    size_t glyph_count,
+                                   uint8_t content_mode,
                                    uint16_t black,
                                    uint16_t dream_line,
                                    uint16_t dream_text)
@@ -848,13 +1062,25 @@ static void draw_sleep_dream_story(uint32_t phase_ms,
         draw_line(px[27], py[27], close_x, close_y, 2, outline);
     }
 
-    if (morph > 0.12f) {
+    if (morph > 0.58f) {
         int text_scale = rounded_float(morph * 1000.0f);
         uint8_t text_alpha = (uint8_t)rounded_float(morph * 15.0f);
-        draw_thought_text_scaled(glyphs, glyph_count, center_x, 46 + bob,
-                                 text_scale,
-                                 thought_alpha_color(dream_text, text_alpha),
-                                 phase_ms - 4900U);
+        uint16_t visible_text = thought_alpha_color(dream_text, text_alpha);
+        uint16_t accent = thought_alpha_color(rgb565(241, 185, 72), text_alpha);
+        if (content_mode == 0U) {
+            draw_thought_text_scaled(glyphs, glyph_count, center_x, 46 + bob,
+                                     text_scale, visible_text,
+                                     phase_ms - 4900U);
+        } else if (content_mode == 1U) {
+            draw_dream_icon(thought, center_x, 45 + bob, 10,
+                            idle_ms, visible_text, accent, black);
+        } else {
+            draw_dream_icon(thought, center_x - 18, 45 + bob, 7,
+                            idle_ms, visible_text, accent, black);
+            draw_thought_text_scaled(glyphs, glyph_count, center_x + 17,
+                                     46 + bob, text_scale * 560 / 1000,
+                                     visible_text, phase_ms - 4900U);
+        }
     }
     (void)black;
 }
@@ -865,11 +1091,38 @@ static void draw_sleep_thought_bubble(uint32_t elapsed_ms)
     uint8_t glyphs[4];
     size_t glyph_count;
     taskENTER_CRITICAL(&s_thought_lock);
-    thought = s_sleep_thought;
-    memcpy(glyphs, s_sleep_glyphs, sizeof(glyphs));
-    glyph_count = s_sleep_glyph_count;
+    size_t deck_count = s_dream_deck_count;
+    uint32_t deck_slot = deck_count > 0U
+        ? (elapsed_ms / 12000U) % deck_count : 0U;
+    if (deck_count > 0U) {
+        thought = s_dream_deck[deck_slot].thought;
+        memcpy(glyphs, s_dream_deck[deck_slot].glyphs, sizeof(glyphs));
+        glyph_count = s_dream_deck[deck_slot].glyph_count;
+    } else {
+        thought = s_sleep_thought;
+        memcpy(glyphs, s_sleep_glyphs, sizeof(glyphs));
+        glyph_count = s_sleep_glyph_count;
+    }
     taskEXIT_CRITICAL(&s_thought_lock);
     if (thought == BABY_TANK_THOUGHT_NONE || glyph_count == 0U) return;
+
+    /* The cloud mood often keeps the same cached "软绵绵" caption for hours.
+     * Show that approved/cloud caption first, then rotate gentle local dream
+     * fragments once a minute. This adds no model call, NVS write or buffer. */
+    static const baby_tank_thought_t alternatives[] = {
+        BABY_TANK_THOUGHT_MOON,
+        BABY_TANK_THOUGHT_FLOWER,
+        BABY_TANK_THOUGHT_FISH,
+        BABY_TANK_THOUGHT_STAR,
+        BABY_TANK_THOUGHT_MUSIC,
+    };
+    uint32_t caption_slot = deck_count > 0U ? 0U : (elapsed_ms / 60000U) %
+        (1U + sizeof(alternatives) / sizeof(alternatives[0]));
+    if (caption_slot != 0U) {
+        baby_tank_thought_t selected = alternatives[caption_slot - 1U];
+        glyph_count = thought_caption_count(selected);
+        memcpy(glyphs, s_thought_captions[selected], sizeof(glyphs));
+    }
 
     const uint16_t black = rgb565(0, 0, 0);
     const uint16_t dream_line = rgb565(70, 150, 143);
@@ -878,7 +1131,9 @@ static void draw_sleep_thought_bubble(uint32_t elapsed_ms)
     s_canvas_offset_y = 0;
     uint32_t phase_ms = elapsed_ms % 12000U;
 
-    draw_sleep_dream_story(phase_ms, glyphs, glyph_count, black,
+    uint8_t content_mode = deck_count > 0U ? (uint8_t)(deck_slot % 3U) : 0U;
+    draw_sleep_dream_story(phase_ms, thought, glyphs, glyph_count,
+                           content_mode, black,
                            dream_line, dream_text);
 }
 
@@ -943,6 +1198,363 @@ esp_err_t baby_tank_display_render_drawing(const baby_tank_drawing_t *drawing)
         ESP_RETURN_ON_ERROR(gpio_set_level(LCD_PIN_BACKLIGHT,
                             LCD_BACKLIGHT_ON_LEVEL), TAG,
                             "drawing backlight failed");
+        s_backlight_on = true;
+    }
+    return ESP_OK;
+}
+
+/* Six tiny idle stories share one 120x120 logical grid. Every art pixel maps
+ * to exactly 2x2 LCD pixels: no interpolation, second framebuffer or JPEG. */
+static void scene_box(int x, int y, int width, int height, uint16_t color)
+{
+    int left = x < 0 ? 0 : x;
+    int top = y < 0 ? 0 : y;
+    int right = x + width > 120 ? 120 : x + width;
+    int bottom = y + height > 120 ? 120 : y + height;
+    for (int row = top; row < bottom; ++row) {
+        for (int column = left; column < right; ++column) {
+            int physical = row * 2 * LCD_WIDTH + column * 2;
+            s_framebuffer[physical] = color;
+            s_framebuffer[physical + 1] = color;
+            s_framebuffer[physical + LCD_WIDTH] = color;
+            s_framebuffer[physical + LCD_WIDTH + 1] = color;
+        }
+    }
+}
+
+typedef struct {
+    uint16_t ink;
+    uint16_t sky;
+    uint16_t floor;
+    uint16_t ambient;
+    uint16_t white;
+    uint16_t shadow;
+    uint16_t cyan;
+    uint16_t orange;
+    uint16_t green;
+    uint16_t pale;
+    uint16_t label;
+} pixel_palette_t;
+
+static pixel_palette_t scene_palette(baby_tank_scene_t scene)
+{
+    pixel_palette_t p = {
+        .ink = rgb565(13, 29, 37),
+        .sky = rgb565(22, 46, 57),
+        .floor = rgb565(37, 65, 71),
+        .ambient = rgb565(51, 91, 101),
+        .white = rgb565(245, 245, 229),
+        .shadow = rgb565(161, 177, 170),
+        .cyan = rgb565(62, 217, 220),
+        .orange = rgb565(242, 176, 100),
+        .green = rgb565(126, 190, 151),
+        .pale = rgb565(110, 150, 157),
+        .label = rgb565(110, 150, 157),
+    };
+    /* Outdoor stories run only in daytime: use a recognizable blue sky,
+     * while indoor stories keep subdued wall colors. Shared accent ramps
+     * keep the six scenes and the white character visually coherent. */
+    switch (scene) {
+    case BABY_TANK_SCENE_EXERCISE:
+        p.sky = rgb565(61, 142, 194);
+        p.floor = rgb565(59, 104, 95);
+        p.ambient = rgb565(112, 173, 169);
+        p.pale = rgb565(192, 226, 227);
+        p.label = rgb565(24, 72, 101);
+        break;
+    case BABY_TANK_SCENE_READING:
+        p.sky = rgb565(53, 48, 63);
+        p.floor = rgb565(72, 63, 77);
+        p.ambient = rgb565(91, 76, 91);
+        break;
+    case BABY_TANK_SCENE_BLOCKS:
+        p.sky = rgb565(36, 56, 72);
+        p.floor = rgb565(56, 76, 85);
+        p.ambient = rgb565(76, 98, 106);
+        break;
+    case BABY_TANK_SCENE_EXPLORE:
+        p.sky = rgb565(54, 136, 187);
+        p.floor = rgb565(57, 108, 85);
+        p.ambient = rgb565(93, 158, 143);
+        p.pale = rgb565(185, 219, 219);
+        p.label = rgb565(22, 69, 97);
+        break;
+    case BABY_TANK_SCENE_CLOUDS:
+        p.sky = rgb565(55, 145, 202);
+        p.floor = rgb565(65, 114, 83);
+        p.ambient = rgb565(109, 170, 161);
+        p.pale = rgb565(188, 222, 232);
+        p.label = rgb565(20, 68, 101);
+        break;
+    case BABY_TANK_SCENE_TIDY:
+        p.sky = rgb565(49, 55, 67);
+        p.floor = rgb565(69, 73, 80);
+        p.ambient = rgb565(89, 91, 96);
+        break;
+    default: break;
+    }
+    return p;
+}
+
+static void scene_tank(int x, int y, unsigned frame,
+                       baby_tank_scene_t scene,
+                       const pixel_palette_t *p)
+{
+    int bob = frame == 1U ? -1 : 0;
+    /* Smaller, recognizable white head / wedge / black treads. The props
+     * now own the foreground instead of being crowded out by the mascot. */
+    scene_box(x, y + 30, 9, 25, p->ink);
+    scene_box(x + 33, y + 30, 9, 25, p->ink);
+    scene_box(x + 2, y + 33, 5, 19, p->floor);
+    scene_box(x + 35, y + 33, 5, 19, p->floor);
+    for (int row = 0; row < 4; ++row) {
+        int tread_y = y + 35 + row * 4 + (int)(frame & 1U);
+        scene_box(x + 2, tread_y, 5, 1, p->ink);
+        scene_box(x + 35, tread_y, 5, 1, p->ink);
+    }
+    scene_box(x + 8, y + 29 + bob, 27, 23, p->shadow);
+    scene_box(x + 10, y + 28 + bob, 24, 22, p->white);
+    scene_box(x + 13, y + 49 + bob, 21, 2, p->ink);
+    scene_box(x + 10, y + 5 + bob, 23, 27, p->shadow);
+    scene_box(x + 9, y + 4 + bob, 23, 26, p->white);
+    scene_box(x + 12, y + 8 + bob, 17, 18, p->ink);
+    int eyes_y = scene == BABY_TANK_SCENE_CLOUDS ? 12 :
+                 scene == BABY_TANK_SCENE_READING ? 17 : 14;
+    scene_box(x + 14, y + eyes_y + bob, 4, 1, p->cyan);
+    scene_box(x + 23, y + eyes_y + bob, 4, 1, p->cyan);
+    scene_box(x + 19, y + 20 + bob, 3, 1, p->cyan);
+    scene_box(x + 18, y + 2 + bob, 6, 2, p->white);
+    scene_box(x + 20, y + 1 + bob, 2, 1, p->ink);
+}
+
+static void scene_cloud(int x, int y, const pixel_palette_t *p)
+{
+    scene_box(x + 4, y, 11, 3, p->white);
+    scene_box(x, y + 3, 24, 5, p->white);
+    scene_box(x + 7, y + 8, 12, 2, p->pale);
+}
+
+static void scene_background(baby_tank_scene_t scene, unsigned frame,
+                             const pixel_palette_t *p)
+{
+    scene_box(0, 0, 120, 120, p->sky);
+    scene_box(0, 86, 120, 34, p->floor);
+    scene_box(0, 86, 120, 2, p->ambient);
+    switch (scene) {
+    case BABY_TANK_SCENE_EXERCISE:
+        /* Early light, running-track stripes, and a clear exercise mat. */
+        scene_box(0, 67, 120, 19, p->ambient);
+        scene_box(7, 15, 16, 16, p->orange);
+        scene_box(11, 19, 8, 8, p->sky);
+        scene_box(0, 72, 28, 2, p->pale);
+        scene_box(94, 72, 26, 2, p->pale);
+        scene_box(12, 101, 96, 7, p->ink);
+        scene_box(17, 103, 86, 3, p->cyan);
+        break;
+    case BABY_TANK_SCENE_READING:
+        /* A quiet room: two shelves and a warm reading lamp. */
+        scene_box(4, 29, 22, 56, p->ink);
+        scene_box(6, 31, 18, 4, p->ambient);
+        scene_box(7, 38, 4, 13, p->orange);
+        scene_box(13, 42, 5, 9, p->pale);
+        scene_box(20, 36, 3, 15, p->green);
+        scene_box(6, 54, 18, 3, p->ambient);
+        scene_box(9, 58, 5, 16, p->green);
+        scene_box(16, 61, 5, 13, p->orange);
+        scene_box(94, 39, 2, 43, p->shadow);
+        scene_box(87, 38, 16, 4, p->shadow);
+        scene_box(90, 43, 11, 7, p->orange);
+        scene_box(93, 48, 5, 2, p->white);
+        scene_box(17, 101, 87, 5, p->ambient);
+        break;
+    case BABY_TANK_SCENE_BLOCKS:
+        /* Broad play mat and a pair of simple wall pennants. */
+        scene_box(0, 30, 120, 2, p->ambient);
+        scene_box(11, 31, 12, 14, p->orange);
+        scene_box(15, 45, 4, 4, p->orange);
+        scene_box(98, 31, 12, 14, p->green);
+        scene_box(102, 45, 4, 4, p->green);
+        scene_box(9, 101, 102, 7, p->ink);
+        scene_box(13, 103, 94, 3, p->ambient);
+        break;
+    case BABY_TANK_SCENE_EXPLORE:
+        /* Layered distant hills and a trail; neither moves the chassis. */
+        scene_box(0, 55, 21, 31, p->ambient);
+        scene_box(8, 49, 19, 37, p->ambient);
+        scene_box(94, 51, 26, 35, p->ambient);
+        scene_box(102, 45, 18, 41, p->ambient);
+        scene_box(0, 81, 120, 6, p->green);
+        scene_box(6, 101, 36, 2, p->pale);
+        scene_box(78, 105, 36, 2, p->pale);
+        break;
+    case BABY_TANK_SCENE_CLOUDS:
+        /* Large sky shapes carry the story; no noisy pixel texture. */
+        scene_box(0, 70, 120, 16, p->ambient);
+        scene_box(0, 76, 26, 10, p->green);
+        scene_box(92, 73, 28, 13, p->green);
+        scene_cloud(4 + (int)(frame & 1U), 14, p);
+        scene_cloud(91 - (int)(frame & 1U), 31, p);
+        break;
+    case BABY_TANK_SCENE_TIDY:
+        /* Side shelves make the storage action readable as a room. */
+        scene_box(1, 29, 28, 55, p->ink);
+        scene_box(3, 31, 24, 4, p->ambient);
+        scene_box(5, 39, 6, 17, p->green);
+        scene_box(13, 43, 7, 13, p->orange);
+        scene_box(22, 39, 3, 17, p->pale);
+        scene_box(3, 58, 24, 4, p->ambient);
+        scene_box(95, 31, 22, 54, p->ambient);
+        scene_box(98, 35, 16, 2, p->shadow);
+        scene_box(98, 58, 16, 2, p->shadow);
+        scene_box(15, 101, 90, 2, p->pale);
+        break;
+    default: break;
+    }
+}
+
+/* A quiet 10x10 status line: deliberately smaller and dimmer than the art.
+ * One logical pixel is still exactly 2x2 LCD pixels, with no smoothing. */
+static const uint16_t s_scene_label_glyphs[][10] = {
+    /* 做 */ {0x0a4,0x0a0,0x1ff,0x1aa,0x1fa,0x0d4,0x0f4,0x0ce,0x092,0x000},
+    /* 操 */ {0x0bc,0x0a4,0x1fc,0x0b6,0x0f6,0x180,0x0fe,0x0ac,0x14a,0x000},
+    /* 看 */ {0x1fe,0x020,0x0fc,0x1ff,0x07c,0x1fc,0x17c,0x044,0x07c,0x000},
+    /* 书 */ {0x020,0x026,0x1fc,0x024,0x020,0x1fe,0x022,0x024,0x020,0x000},
+    /* 积 */ {0x0de,0x192,0x092,0x1d2,0x09e,0x1c0,0x194,0x092,0x0a0,0x000},
+    /* 木 */ {0x010,0x010,0x1fe,0x030,0x078,0x0d8,0x094,0x112,0x030,0x000},
+    /* 冒 */ {0x000,0x1fe,0x17a,0x17a,0x0fc,0x0fc,0x0fc,0x084,0x0fc,0x000},
+    /* 险 */ {0x010,0x198,0x0a6,0x0fe,0x180,0x0b4,0x0bc,0x188,0x37e,0x000},
+    /* 云 */ {0x000,0x0fc,0x000,0x1fe,0x020,0x048,0x0c4,0x1fe,0x000,0x000},
+    /* 整 */ {0x048,0x1ee,0x1f8,0x1ec,0x0ea,0x1fc,0x01c,0x080,0x1fe,0x000},
+    /* 理 */ {0x03e,0x1ea,0x0be,0x1ea,0x0be,0x088,0x0be,0x188,0x07f,0x000},
+    /* 中 */ {0x030,0x020,0x1fe,0x122,0x122,0x1fe,0x120,0x020,0x030,0x000},
+};
+
+static void scene_label_glyph(unsigned glyph, int x, int y, uint16_t color)
+{
+    for (int row = 0; row < 10; ++row) {
+        uint16_t bits = s_scene_label_glyphs[glyph][row];
+        for (int column = 0; column < 10; ++column) {
+            if ((bits & (uint16_t)(0x0200U >> column)) != 0U) {
+                scene_box(x + column, y + row, 1, 1, color);
+            }
+        }
+    }
+}
+
+static void scene_label(baby_tank_scene_t scene, const pixel_palette_t *p)
+{
+    /* 做操中… / 看书中… / 积木中… / 冒险中… / 看云中… / 整理中… */
+    static const uint8_t pairs[BABY_TANK_SCENE_COUNT][2] = {
+        [BABY_TANK_SCENE_EXERCISE] = {0, 1},
+        [BABY_TANK_SCENE_READING] = {2, 3},
+        [BABY_TANK_SCENE_BLOCKS] = {4, 5},
+        [BABY_TANK_SCENE_EXPLORE] = {6, 7},
+        [BABY_TANK_SCENE_CLOUDS] = {2, 8},
+        [BABY_TANK_SCENE_TIDY] = {9, 10},
+    };
+    scene_label_glyph(pairs[scene][0], 78, 5, p->label);
+    scene_label_glyph(pairs[scene][1], 89, 5, p->label);
+    scene_label_glyph(11, 100, 5, p->label);
+    scene_box(112, 13, 1, 1, p->label);
+    scene_box(115, 13, 1, 1, p->label);
+    scene_box(118, 13, 1, 1, p->label);
+}
+
+static void scene_props(baby_tank_scene_t scene, unsigned frame,
+                        const pixel_palette_t *p)
+{
+    switch (scene) {
+    case BABY_TANK_SCENE_EXERCISE:
+        /* Lift alternates a few pixels; large weights explain the action. */
+        scene_box(27, 78 - (int)(frame & 1U) * 4, 66, 4, p->shadow);
+        scene_box(24, 68 - (int)(frame & 1U) * 4, 8, 23, p->cyan);
+        scene_box(33, 72 - (int)(frame & 1U) * 4, 5, 15, p->cyan);
+        scene_box(82, 72 - (int)(frame & 1U) * 4, 5, 15, p->cyan);
+        scene_box(88, 68 - (int)(frame & 1U) * 4, 8, 23, p->cyan);
+        scene_box(19, 53, 3, 10, p->orange);
+        scene_box(14, 57, 13, 3, p->orange);
+        scene_box(99, 53, 3, 10, p->orange);
+        scene_box(94, 57, 13, 3, p->orange);
+        break;
+    case BABY_TANK_SCENE_READING:
+        /* Open book overlaps the chest instead of hiding behind it. */
+        scene_box(29, 75, 62, 24, p->ink);
+        scene_box(31, 73, 28, 23, p->orange);
+        scene_box(60, 73, 28, 23, p->white);
+        scene_box(59, 75, 2, 20, p->shadow);
+        scene_box(36, 80, 17, 2, p->ink);
+        scene_box(36, 86, 15, 2, p->ink);
+        scene_box(66, 80, 17, 2, p->pale);
+        scene_box(66, 86, 13, 2, p->pale);
+        if (frame == 3U) scene_box(87, 66, 4, 6, p->cyan);
+        break;
+    case BABY_TANK_SCENE_BLOCKS:
+        scene_box(8, 72, 23, 23, p->orange);
+        scene_box(11, 75, 17, 3, p->white);
+        scene_box(89, 72, 23, 23, p->green);
+        scene_box(92, 75, 17, 3, p->white);
+        scene_box(76, 49 - (int)(frame == 2U) * 5, 22, 22, p->cyan);
+        scene_box(79, 52 - (int)(frame == 2U) * 5, 16, 3, p->white);
+        scene_box(78, 68, 3, 5, p->pale);
+        break;
+    case BABY_TANK_SCENE_EXPLORE:
+        /* Folded map with a bold route and a compass marker. */
+        scene_box(25, 73, 70, 27, p->ink);
+        scene_box(28, 75, 20, 22, p->green);
+        scene_box(49, 75, 20, 22, p->white);
+        scene_box(70, 75, 22, 22, p->green);
+        scene_box(48, 75, 2, 22, p->shadow);
+        scene_box(69, 75, 2, 22, p->shadow);
+        scene_box(36, 87, 17, 3, p->orange);
+        scene_box(52, 82, 18, 3, p->orange);
+        scene_box(68, 80, 13, 3, p->orange);
+        scene_box(80, 76, 5, 8, p->cyan);
+        scene_box(102, 24, 3, 20, p->cyan);
+        scene_box(94, 32, 19, 3, p->cyan);
+        break;
+    case BABY_TANK_SCENE_CLOUDS:
+        scene_box(8, 75, 3, 24, p->green);
+        scene_box(1, 69, 17, 9, p->orange);
+        scene_box(6, 71, 4, 4, p->white);
+        scene_box(105, 76, 3, 23, p->green);
+        scene_box(98, 70, 17, 9, p->cyan);
+        scene_box(103, 72, 4, 4, p->white);
+        break;
+    case BABY_TANK_SCENE_TIDY:
+        scene_box(6, 72, 31, 25, p->orange);
+        scene_box(10, 68, 23, 6, p->white);
+        scene_box(12, 80, 19, 3, p->ink);
+        scene_box(94, 56, 4, 42, p->shadow);
+        scene_box(86, 90, 21, 7, p->green);
+        scene_box(77, 68, 18, 9, p->cyan);
+        scene_box(80, 71, 12, 3, p->white);
+        scene_box(107, 78 - (int)(frame & 1U) * 3, 5, 5, p->pale);
+        break;
+    default: break;
+    }
+}
+
+esp_err_t baby_tank_display_render_scene(baby_tank_scene_t scene,
+                                         uint32_t elapsed_ms)
+{
+    ESP_RETURN_ON_FALSE(s_panel != NULL && s_framebuffer != NULL &&
+                            scene >= 0 && scene < BABY_TANK_SCENE_COUNT,
+                        ESP_ERR_INVALID_ARG, TAG, "pixel scene unavailable");
+    ESP_RETURN_ON_ERROR(wait_for_frame(), TAG, "previous scene frame pending");
+    pixel_palette_t p = scene_palette(scene);
+    unsigned frame = (elapsed_ms / 900U) % 4U;
+    scene_background(scene, frame, &p);
+    scene_tank(39, 32, frame, scene, &p);
+    scene_props(scene, frame, &p);
+    scene_label(scene, &p);
+    draw_status_line();
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+        LCD_WIDTH, LCD_HEIGHT, s_framebuffer), TAG, "scene transfer failed");
+    s_transfer_pending = true;
+    if (!s_backlight_on) {
+        ESP_RETURN_ON_ERROR(wait_for_frame(), TAG, "first scene frame failed");
+        ESP_RETURN_ON_ERROR(gpio_set_level(LCD_PIN_BACKLIGHT,
+            LCD_BACKLIGHT_ON_LEVEL), TAG, "scene backlight failed");
         s_backlight_on = true;
     }
     return ESP_OK;

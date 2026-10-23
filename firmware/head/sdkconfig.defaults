@@ -55,9 +55,9 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # component's IDF 6 default is safer than the older cached 2 KiB value.
 CONFIG_CAMERA_TASK_STACK_SIZE=4096
 # GC2145 RGB565 frames can lose rows with Wi-Fi when DMA writes directly to
-# PSRAM. Stage through a bounded 7.5 KiB internal DMA buffer, then copy each
+# PSRAM. Stage through a bounded ~15 KiB internal DMA buffer, then copy each
 # chunk into the single PSRAM frame buffer.
-CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=8192
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
 # CONFIG_CAMERA_PSRAM_DMA is not set
 
 # AFE/WakeNet and Wi-Fi consume most internal SRAM. TLS handshakes were
@@ -71,3 +71,9 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # Software AES avoids that second internal-memory bottleneck.
 CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# The first ECDHE handshake on this S3 takes about six seconds while audio's
+# higher-priority tasks remain responsive. A 15-second window preserves that
+# headroom while making a genuinely starved idle task fail closed and reboot.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+CONFIG_ESP_TASK_WDT_PANIC=y

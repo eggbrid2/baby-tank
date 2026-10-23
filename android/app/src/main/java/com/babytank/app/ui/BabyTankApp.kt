@@ -2,10 +2,13 @@ package com.babytank.app.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
+import android.provider.Settings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -49,6 +52,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -57,6 +61,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -99,12 +105,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.babytank.app.BabyTankViewModel
+import com.babytank.app.cloud.ParentMemoryState
 import com.babytank.app.R
 import com.babytank.app.model.CapabilityReadiness
 import com.babytank.app.model.BabyExpressions
 import com.babytank.app.model.ControlLinkPhase
 import com.babytank.app.model.ControlLinkState
 import com.babytank.app.model.DiagnosticPhase
+import com.babytank.app.model.DiagnosticSnapshot
 import com.babytank.app.model.DiagnosticState
 import com.babytank.app.model.HardwareCapability
 import com.babytank.app.model.HardwareCatalog
@@ -113,7 +121,6 @@ import com.babytank.app.model.NearbyDevice
 import com.babytank.app.model.ScanPhase
 import com.babytank.app.model.VideoPhase
 import com.babytank.app.model.VideoState
-import com.babytank.app.model.WifiDiscoveryState
 import com.babytank.app.wifi.PortalState
 import kotlin.math.sqrt
 import kotlin.math.roundToInt
@@ -121,21 +128,34 @@ import java.security.SecureRandom
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.StateFlow
 
 @Composable
 fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
     var screen by rememberSaveable { mutableStateOf(AppScreen.Home) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) viewModel.exportParentData(uri)
+    }
+    val openParentMemory = {
+        screen = AppScreen.Memory
+    }
     val scanState by viewModel.scanState.collectAsStateWithLifecycle()
     val selectedDevice by viewModel.selectedDevice.collectAsStateWithLifecycle()
     val controlState by viewModel.controlState.collectAsStateWithLifecycle()
-    val personalityStatus by viewModel.personalityStatus.collectAsStateWithLifecycle()
     val diagnosticState by viewModel.diagnosticState.collectAsStateWithLifecycle()
     val videoState by viewModel.videoState.collectAsStateWithLifecycle()
-    val wifiState by viewModel.wifiState.collectAsStateWithLifecycle()
+    val videoFrame = viewModel.videoFrame
     val portalState by viewModel.portalState.collectAsStateWithLifecycle()
+    val parentMemoryState by viewModel.parentMemoryState.collectAsStateWithLifecycle()
+    val cloudDeviceId by viewModel.cloudDeviceId.collectAsStateWithLifecycle()
+    val interactionSync by viewModel.interactionSync.collectAsStateWithLifecycle()
+    val textChat by viewModel.textChat.collectAsStateWithLifecycle()
+    val drawingGuess by viewModel.drawingGuess.collectAsStateWithLifecycle()
     BackHandler(enabled = screen != AppScreen.Home) {
         if (screen == AppScreen.Control) {
             viewModel.stopMotion()
+            viewModel.disconnectCamera()
             viewModel.setRemoteMode(false)
         }
         screen = parentScreen(screen)
@@ -145,6 +165,7 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
                 viewModel.stopMotion()
+                viewModel.disconnectCamera()
                 viewModel.setRemoteMode(false)
             }
         }
@@ -155,7 +176,33 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
         if (screen != AppScreen.Control && scanState.phase in
             setOf(ScanPhase.Connected, ScanPhase.Provisioned)
         ) {
+            viewModel.disconnectCamera()
             viewModel.setRemoteMode(false)
+        }
+    }
+    LaunchedEffect(screen, scanState.phase) {
+        if (screen == AppScreen.Home && scanState.phase in
+            setOf(ScanPhase.Connected, ScanPhase.Provisioned)
+        ) {
+            while (isActive) {
+                viewModel.refreshDiagnostics()
+                delay(10_000)
+            }
+        }
+    }
+    LaunchedEffect(screen, scanState.phase) {
+        if (screen == AppScreen.Settings && scanState.phase in
+            setOf(ScanPhase.Connected, ScanPhase.Provisioned)
+        ) {
+            viewModel.refreshDiagnostics()
+        }
+    }
+    LaunchedEffect(screen) {
+        if (screen == AppScreen.Home) {
+            while (isActive) {
+                viewModel.refreshHomeState()
+                delay(60_000)
+            }
         }
     }
 
@@ -165,6 +212,7 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
             scanState.phase,
             controlState,
             videoState,
+            videoFrame,
             { viewModel.startScan(); screen = AppScreen.Pair },
             viewModel::hasWifiPermission,
             viewModel::connectCamera,
@@ -197,10 +245,17 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
                 AppScreen.Home -> HomeScreen(
                     selectedDevice,
                     scanState.phase,
+                    diagnosticState.snapshot,
+                    parentMemoryState,
+                    cloudDeviceId,
                     onDrive = { screen = AppScreen.Control },
                     onTalk = viewModel::startListening,
+                    onStopTalk = viewModel::stopListening,
+                    onTextChat = { screen = AppScreen.Chat },
                     onPlay = { screen = AppScreen.Interaction },
                     onConnect = { screen = AppScreen.Pair },
+                    onMemory = openParentMemory,
+                    onSleep = viewModel::putToSleep,
                     onSettings = { screen = AppScreen.Settings },
                 )
                 AppScreen.Settings -> SettingsScreen(
@@ -208,32 +263,46 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
                     phase = scanState.phase,
                     diagnostics = diagnosticState,
                     onPair = { screen = AppScreen.Pair },
+                    onNetwork = { screen = AppScreen.Network },
                     onCharacter = { screen = AppScreen.Character },
+                    onMemory = openParentMemory,
                     onLab = { screen = AppScreen.Lab },
                     onVolume = viewModel::setVolume,
+                    onSetupHotspot = viewModel::setSetupHotspot,
+                    onRestart = viewModel::restartDevice,
                     onBack = { screen = AppScreen.Home },
                 )
                 AppScreen.Interaction -> InteractionScreen(
                     connected = selectedDevice != null && scanState.phase in
                         setOf(ScanPhase.Connected, ScanPhase.Provisioned),
                     onExpression = viewModel::showExpression,
-                    onGameResult = viewModel::announceGameResult,
+                    onExpressionConfirmed = viewModel::showExpressionConfirmed,
+                    onGameResultConfirmed = viewModel::announceGameResultConfirmed,
+                    onFeedFinished = viewModel::finishFeeding,
+                    onPokeConfirmed = viewModel::pokeConfirmed,
+                    onNeedEvent = viewModel::recordInteraction,
+                    onNotAccepted = viewModel::interactionNotAccepted,
+                    syncStatus = interactionSync,
+                    onGuessDrawing = {
+                        viewModel.resetDrawingGuess()
+                        screen = AppScreen.GuessDrawing
+                    },
                     onBack = { screen = AppScreen.Home },
                 )
                 AppScreen.Pair -> PairScreen(
                     phase = scanState.phase,
                     devices = scanState.devices,
                     detail = scanState.detail,
-                    wifi = wifiState,
                     selectedDevice = selectedDevice,
-                    portal = portalState,
-                    hasPermission = viewModel::hasSetupPermission,
+                    hasPermission = viewModel::hasBlePermission,
                     onScan = viewModel::startScan,
-                    onRefreshWifi = viewModel::refreshWifi,
-                    onScanWifi = viewModel::scanWifi,
                     onDevice = viewModel::selectDevice,
                     onConnect = viewModel::connectDevice,
-                    onProvision = viewModel::provisionWifi,
+                    onBack = { screen = AppScreen.Settings },
+                )
+                AppScreen.Network -> NetworkSetupScreen(
+                    portal = portalState,
+                    hasPermission = viewModel::hasWifiSetupPermission,
                     onOpenPortal = viewModel::openSetupPortal,
                     onClosePortal = viewModel::closeSetupPortal,
                     onBack = { screen = AppScreen.Settings },
@@ -243,6 +312,7 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
                     scanState.phase,
                     controlState,
                     videoState,
+                    videoFrame,
                     { viewModel.startScan(); screen = AppScreen.Pair },
                     viewModel::hasWifiPermission,
                     viewModel::connectCamera,
@@ -273,14 +343,52 @@ fun BabyTankApp(viewModel: BabyTankViewModel = viewModel()) {
                     onLight = viewModel::setLight,
                     onSpeaker = viewModel::testSpeaker,
                     onListen = viewModel::startListening,
+                    onStopListen = viewModel::stopListening,
                     onBack = { screen = AppScreen.Settings },
                 )
                 AppScreen.Character -> CharacterScreen(
                     selectedDevice,
-                    scanState.phase,
-                    personalityStatus,
+                    parentMemoryState,
                     viewModel::syncPersonality,
                     onBack = { screen = AppScreen.Settings },
+                )
+                AppScreen.Memory -> ParentMemoryScreen(
+                    state = parentMemoryState,
+                    onPair = viewModel::pairParent,
+                    onRefresh = viewModel::refreshParentMemory,
+                    onAddMemory = viewModel::addParentMemory,
+                    onDeleteMemory = viewModel::deleteParentMemory,
+                    onUpdateMemory = viewModel::updateParentMemory,
+                    onClearMemories = viewModel::clearParentMemories,
+                    onHistory = viewModel::setQuestionHistory,
+                    onRetention = viewModel::setQuestionRetention,
+                    onPolicy = viewModel::setParentPolicy,
+                    onExport = { exportLauncher.launch("baby-tank-memory.json") },
+                    onDeleteQuestion = viewModel::deleteQuestionHistory,
+                    onLoadMoreQuestions = viewModel::loadMoreQuestions,
+                    onCharacter = { screen = AppScreen.Character },
+                    onLogout = viewModel::logoutParent,
+                    onBack = { screen = AppScreen.Settings },
+                )
+                AppScreen.Chat -> TextChatScreen(
+                    state = textChat,
+                    paired = parentMemoryState.pairedDeviceId != null,
+                    onSend = viewModel::sendTextMessage,
+                    onPair = { screen = AppScreen.Memory },
+                    onBack = { screen = AppScreen.Home },
+                )
+                AppScreen.GuessDrawing -> GuessDrawingScreen(
+                    state = drawingGuess,
+                    paired = parentMemoryState.pairedDeviceId != null,
+                    onGuess = viewModel::submitDrawingGuess,
+                    onCorrect = viewModel::completeDrawingGuess,
+                    onWrong = viewModel::wrongDrawingGuess,
+                    onReset = viewModel::resetDrawingGuess,
+                    onPair = { screen = AppScreen.Memory },
+                    onBack = {
+                        viewModel.resetDrawingGuess()
+                        screen = AppScreen.Interaction
+                    },
                 )
             }
         }
@@ -342,13 +450,56 @@ private fun DetailPage(
 private fun HomeScreen(
     device: NearbyDevice?,
     phase: ScanPhase,
+    diagnostics: DiagnosticSnapshot?,
+    character: ParentMemoryState,
+    cloudDeviceId: String?,
     onDrive: () -> Unit,
     onTalk: () -> Unit,
+    onStopTalk: () -> Unit,
+    onTextChat: () -> Unit,
     onPlay: () -> Unit,
     onConnect: () -> Unit,
+    onMemory: () -> Unit,
+    onSleep: ((Boolean) -> Unit) -> Unit,
     onSettings: () -> Unit,
-) = Page {
+) {
+    var sleepBusy by remember { mutableStateOf(false) }
+    var sleepAccepted by remember { mutableStateOf(false) }
+    LaunchedEffect(sleepAccepted) {
+        if (sleepAccepted) {
+            delay(5_000)
+            sleepAccepted = false
+        }
+    }
+    Page {
     val connected = device != null && phase in setOf(ScanPhase.Connected, ScanPhase.Provisioned)
+    val conversationActive = (diagnostics?.conversationPhase ?: 0) in 1..5
+    val aiStatus = when {
+        !connected -> "设备未连接"
+        diagnostics == null -> "正在读取状态"
+        diagnostics.internetPhase == 3 -> "网络需要登录"
+        diagnostics.internetPhase == 4 || !diagnostics.wifiConnected -> "已断网"
+        diagnostics.conversationPhase in 1..2 -> "正在聆听"
+        diagnostics.conversationPhase == 3 -> "识别中"
+        diagnostics.conversationPhase == 4 -> "正在思考"
+        diagnostics.conversationPhase == 5 || diagnostics.audioPlaying -> "正在回答"
+        diagnostics.conversationPhase == 7 -> "对话出错"
+        diagnostics.cloudReady -> "在线待机"
+        else -> "AI 连接中"
+    }
+    val characterMatches = connected && cloudDeviceId != null &&
+        cloudDeviceId == character.pairedDeviceId
+    val stateFresh = characterMatches && character.stateSyncedAtMillis > 0L &&
+        System.currentTimeMillis() - character.stateSyncedAtMillis < 120_000L &&
+        character.error == null
+    val mood = if (stateFresh) character.mood else null
+    val hunger = character.needs["hunger"] ?: 0
+    val thirst = character.needs["thirst"] ?: 0
+    val energy = character.needs["energy"] ?: 100
+    val stamina = character.needs["stamina"] ?: 100
+    val sleepy = stateFresh && (mood == "sleepy" || energy <= 35 || stamina <= 35)
+    val deviceSleeping = diagnostics?.expression == 22 &&
+        diagnostics.conversationPhase !in 1..5
     item {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -369,12 +520,8 @@ private fun HomeScreen(
                 border = androidx.compose.foundation.BorderStroke(1.dp, Line),
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Image(
-                        painter = painterResource(R.drawable.icon_parent_settings),
-                        contentDescription = "家长设置",
-                        modifier = Modifier.size(30.dp),
-                        contentScale = ContentScale.Fit,
-                    )
+                    MiniGlyph(GlyphKind.Settings, true, Modifier.size(24.dp),
+                        tint = CyanDeep)
                 }
             }
         }
@@ -383,8 +530,12 @@ private fun HomeScreen(
         Card(
             shape = RoundedCornerShape(32.dp),
             colors = CardDefaults.cardColors(containerColor = Ink),
-            modifier = Modifier.fillMaxWidth().height(292.dp).clickable(
-                onClick = if (connected) onTalk else onConnect,
+            modifier = Modifier.fillMaxWidth().height(228.dp).clickable(
+                onClick = when {
+                    !connected -> onConnect
+                    conversationActive -> onStopTalk
+                    else -> onTalk
+                },
             ),
         ) {
             Column(
@@ -398,12 +549,14 @@ private fun HomeScreen(
                         ),
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text(
-                        if (connected) "喵喵在这里" else "等待连接",
-                        color = Color.White.copy(alpha = .72f),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
+                    if (!connected || aiStatus !in setOf("在线待机", "正在读取状态")) {
+                        Text(
+                            aiStatus,
+                            color = Color.White.copy(alpha = .72f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                     Spacer(Modifier.weight(1f))
                     Box(
                         Modifier.size(34.dp).background(Color.White.copy(alpha = .08f), CircleShape),
@@ -413,26 +566,59 @@ private fun HomeScreen(
                     }
                 }
                 BabyFace(
-                    Modifier.fillMaxWidth().weight(1f).padding(horizontal = 12.dp, vertical = 5.dp),
+                    Modifier.fillMaxWidth().weight(1f).padding(horizontal = 32.dp, vertical = 3.dp),
                     connected = connected,
+                    mood = mood,
                 )
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            if (connected) "和我说说话" else "先认识一下吧",
+                            when {
+                                !connected -> "连接宝宝坦克"
+                                conversationActive -> "点一下，结束对话"
+                                else -> "点一下，说句话"
+                            },
                             color = Color.White,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            if (connected) "轻轻点我，就会认真听" else "连接后，我就能陪你玩",
-                            color = Color.White.copy(alpha = .52f),
-                            fontSize = 11.sp,
                         )
                     }
                     Text("→", color = Cyan, fontSize = 22.sp, fontWeight = FontWeight.Light)
                 }
             }
+        }
+    }
+    item {
+        PetNeedsCard(
+            hasState = stateFresh,
+            hunger = hunger,
+            thirst = thirst,
+            energy = ((energy + stamina) / 2).coerceIn(0, 100),
+            sleepy = sleepy,
+            sleeping = deviceSleeping || sleepAccepted,
+            sleepBusy = sleepBusy,
+            onNeeds = onPlay,
+            onSleep = {
+                if (!sleepBusy && connected) {
+                    sleepBusy = true
+                    onSleep { accepted ->
+                        sleepBusy = false
+                        sleepAccepted = accepted
+                    }
+                }
+            },
+        )
+    }
+    item {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            HomeActionCard(
+                title = "打字聊天", color = Paper, art = HomeArt.Chat,
+                modifier = Modifier.weight(1f), onClick = onTextChat,
+            )
+            HomeActionCard(
+                title = "成长记忆", color = Color(0xFFF1EFE8), art = HomeArt.Memory,
+                modifier = Modifier.weight(1f), onClick = onMemory,
+            )
         }
     }
     item {
@@ -442,28 +628,27 @@ private fun HomeScreen(
         ) {
             HomeActionCard(
                 title = "遥控",
-                subtitle = "一起出发",
-                color = SkyWash,
-                drawable = R.drawable.icon_home_drive_v2,
+                color = Color(0xFFF1EFE8),
+                art = HomeArt.Drive,
                 modifier = Modifier.weight(1f),
                 onClick = if (connected) onDrive else onConnect,
             )
             HomeActionCard(
                 title = "互动",
-                subtitle = "玩点什么",
-                color = ButterWash,
-                drawable = R.drawable.icon_home_play_v2,
+                color = Paper,
+                art = HomeArt.Play,
                 modifier = Modifier.weight(1f),
                 onClick = if (connected) onPlay else onConnect,
             )
         }
     }
 }
+}
 
 private enum class InteractionSection { Hub, Feed, Games, Poke, Rps, Fight, Dice }
 
 private enum class InteractionArt {
-    Games, Poke, Feed, Rock, Paper, Scissors, Fight, Dice,
+    Games, Poke, Feed, Guess, Rock, Paper, Scissors, Fight, Dice,
     Strawberry, Apple, Banana, Cake, Cookie, Bread, RiceBall, IceCream,
     Milk, Juice, Water, Yogurt, SoyMilk, Cocoa,
 }
@@ -498,7 +683,14 @@ private data class ArtChoice(
 private fun InteractionScreen(
     connected: Boolean,
     onExpression: (Int) -> Unit,
-    onGameResult: (Int) -> Unit,
+    onExpressionConfirmed: (Int, (Boolean) -> Unit) -> Unit,
+    onGameResultConfirmed: (Int, (Boolean) -> Unit) -> Unit,
+    onFeedFinished: (Int, (Boolean, Int) -> Unit) -> Unit,
+    onPokeConfirmed: ((Boolean) -> Unit) -> Unit,
+    onNeedEvent: (String) -> Unit,
+    onNotAccepted: () -> Unit,
+    syncStatus: String,
+    onGuessDrawing: () -> Unit,
     onBack: () -> Unit,
 ) {
     var section by rememberSaveable { mutableStateOf(InteractionSection.Hub) }
@@ -515,6 +707,7 @@ private fun InteractionScreen(
     var robotTarget by rememberSaveable { mutableStateOf(0) }
     var fightSeconds by rememberSaveable { mutableStateOf(5) }
     var fightRunning by rememberSaveable { mutableStateOf(false) }
+    var fightResultSettled by rememberSaveable { mutableStateOf(false) }
     var diceRolling by rememberSaveable { mutableStateOf(false) }
     var userDie by rememberSaveable { mutableStateOf(1) }
     var robotDie by rememberSaveable { mutableStateOf(1) }
@@ -526,12 +719,16 @@ private fun InteractionScreen(
         outcome = 0
         robotArt = -1
         rpsBusy = false
+        fightResultSettled = false
         diceRolling = false
         feedingChoice = null
     }
 
-    fun announceResult(userOutcome: Int) {
-        onGameResult(if (userOutcome > 0) 1 else if (userOutcome < 0) 0 else 2)
+    fun announceResult(userOutcome: Int, onSettled: (() -> Unit)? = null) {
+        onGameResultConfirmed(if (userOutcome > 0) 1 else if (userOutcome < 0) 0 else 2) {
+            if (it) onNeedEvent("played") else onNotAccepted()
+            onSettled?.invoke()
+        }
         scope.launch { playGameTone(tone, userOutcome) }
     }
 
@@ -571,7 +768,7 @@ private fun InteractionScreen(
                 else -> 5
             },
         )
-        announceResult(outcome)
+        announceResult(outcome) { fightResultSettled = true }
         fightRunning = false
     }
 
@@ -579,8 +776,26 @@ private fun InteractionScreen(
         val choice = feedingChoice ?: return@LaunchedEffect
         result = ""
         delay(3400)
-        result = if (choice.expression >= 47) "${choice.title}喝光啦" else "${choice.title}吃光啦"
-        feedingChoice = null
+        onFeedFinished(choice.expression) { accepted, reaction ->
+            if (accepted) {
+                result = when (reaction) {
+                    1 -> "${choice.title}正合它的口味！"
+                    2 -> "吃完啦，下次想换个口味"
+                    3 -> "怎么又是${choice.title}呀"
+                    4 -> "吃饱喝足，嗝～"
+                    else -> if (choice.expression >= 47) {
+                        "${choice.title}喝光啦"
+                    } else {
+                        "${choice.title}吃光啦"
+                    }
+                }
+                onNeedEvent(if (choice.expression >= 47) "drank" else "fed")
+            } else {
+                result = "头部没有完成这次互动"
+                onNotAccepted()
+            }
+            feedingChoice = null
+        }
     }
 
     feedingChoice?.let { choice ->
@@ -620,35 +835,40 @@ private fun InteractionScreen(
         title = pageTitle,
         onBack = navigateBack,
         trailing = {
-            StatusPill(
-                if (connected) "已连接" else "未连接",
-                if (connected) CyanDeep else Coral,
-            )
+            if (!connected) StatusPill("未连接", Coral)
         },
     ) {
+        if (syncStatus != "成长数值尚未同步" &&
+            syncStatus != "成长数值已同步到云端" &&
+            syncStatus != "正在同步成长数值…"
+        ) {
+            item { InteractionResult(syncStatus) }
+        }
         when (section) {
             InteractionSection.Hub -> {
                 item {
-                    IllustratedMenuCard("玩游戏", "三种离线小游戏", InteractionArt.Games,
-                        Lavender.copy(.55f)) {
-                        section = InteractionSection.Games
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        InteractionMenuTile("玩游戏", InteractionArt.Games, Paper, Modifier.weight(1f)) {
+                            section = InteractionSection.Games
+                        }
+                        InteractionMenuTile("戳一戳", InteractionArt.Poke, Color(0xFFF1EFE8), Modifier.weight(1f)) {
+                            section = InteractionSection.Poke
+                        }
                     }
                 }
                 item {
-                    IllustratedMenuCard("戳一戳", "看看宝宝的反应", InteractionArt.Poke,
-                        MintWash) {
-                        section = InteractionSection.Poke
-                    }
-                }
-                item {
-                    IllustratedMenuCard("喂东西", "食物和饮品", InteractionArt.Feed,
-                        Cream.copy(.62f)) {
-                        section = InteractionSection.Feed
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        InteractionMenuTile("喂东西", InteractionArt.Feed, Color(0xFFF1EFE8), Modifier.weight(1f)) {
+                            section = InteractionSection.Feed
+                        }
+                        InteractionMenuTile(
+                            "猜猜我画的", InteractionArt.Guess, Paper,
+                            Modifier.weight(1f), onGuessDrawing)
                     }
                 }
             }
             InteractionSection.Feed -> {
-                item { InteractionHint("食物", "点击后，设备同步播放吃东西动作") }
+                item { Text("食物", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
                 val foods = listOf(
                     ArtChoice("草莓", 39, InteractionArt.Strawberry),
                     ArtChoice("苹果", 40, InteractionArt.Apple),
@@ -665,14 +885,19 @@ private fun InteractionScreen(
                             ArtChoiceButton(choice, connected && feedingChoice == null, Modifier.weight(1f)) {
                                 tone.startTone(ToneGenerator.TONE_PROP_BEEP, 70)
                                 feedingChoice = choice
-                                feedingRun += 1
-                                onExpression(choice.expression)
+                                onExpressionConfirmed(choice.expression) { accepted ->
+                                    if (accepted) feedingRun += 1 else {
+                                        feedingChoice = null
+                                        result = "头部未接受动作，成长数值未改变"
+                                        onNotAccepted()
+                                    }
+                                }
                             }
                         }
                         if (row.size == 1) Spacer(Modifier.weight(1f))
                     }
                 }
-                item { InteractionHint("饮品", "点击后，设备同步播放喝东西动作") }
+                item { Text("饮品", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
                 val drinks = listOf(
                     ArtChoice("牛奶", 47, InteractionArt.Milk),
                     ArtChoice("果汁", 48, InteractionArt.Juice),
@@ -687,8 +912,13 @@ private fun InteractionScreen(
                             ArtChoiceButton(choice, connected && feedingChoice == null, Modifier.weight(1f)) {
                                 tone.startTone(ToneGenerator.TONE_PROP_BEEP, 70)
                                 feedingChoice = choice
-                                feedingRun += 1
-                                onExpression(choice.expression)
+                                onExpressionConfirmed(choice.expression) { accepted ->
+                                    if (accepted) feedingRun += 1 else {
+                                        feedingChoice = null
+                                        result = "头部未接受动作，成长数值未改变"
+                                        onNotAccepted()
+                                    }
+                                }
                             }
                         }
                     }
@@ -697,21 +927,16 @@ private fun InteractionScreen(
             }
             InteractionSection.Games -> {
                 item {
-                    IllustratedMenuCard("石头剪刀布", "同时出手", InteractionArt.Scissors,
-                        Lavender.copy(.55f)) {
-                        resetRound(); section = InteractionSection.Rps
-                    }
-                }
-                item {
-                    IllustratedMenuCard("打架", "五秒连点比赛", InteractionArt.Fight,
-                        Coral.copy(.22f)) {
-                        resetRound(); section = InteractionSection.Fight
-                    }
-                }
-                item {
-                    IllustratedMenuCard("摇骰子", "和宝宝比点数", InteractionArt.Dice,
-                        MintWash) {
-                        resetRound(); section = InteractionSection.Dice
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        InteractionMenuTile("石头剪刀布", InteractionArt.Scissors, Lavender.copy(.55f), Modifier.weight(1f)) {
+                            resetRound(); section = InteractionSection.Rps
+                        }
+                        InteractionMenuTile("打架", InteractionArt.Fight, Coral.copy(.22f), Modifier.weight(1f)) {
+                            resetRound(); section = InteractionSection.Fight
+                        }
+                        InteractionMenuTile("摇骰子", InteractionArt.Dice, MintWash, Modifier.weight(1f)) {
+                            resetRound(); section = InteractionSection.Dice
+                        }
                     }
                 }
             }
@@ -719,9 +944,15 @@ private fun InteractionScreen(
                 item {
                     Button(
                         onClick = {
-                            val reactions = listOf(6, 7, 2, 10)
-                            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 65)
-                            onExpression(reactions[random.nextInt(reactions.size)])
+                            onPokeConfirmed {
+                                if (it) {
+                                    result = "戳到啦"
+                                    onNeedEvent("poked")
+                                } else {
+                                    result = "它现在正忙，等一下再戳"
+                                    onNotAccepted()
+                                }
+                            }
                         },
                         enabled = connected,
                         modifier = Modifier.fillMaxWidth().height(230.dp),
@@ -731,6 +962,7 @@ private fun InteractionScreen(
                         InteractionArtIcon(InteractionArt.Poke, Ink, Modifier.size(150.dp))
                     }
                 }
+                if (result.isNotBlank()) item { InteractionResult(result) }
             }
             InteractionSection.Rps -> {
                 item {
@@ -821,7 +1053,7 @@ private fun InteractionScreen(
                                         tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 35)
                                     }
                                 },
-                                enabled = connected,
+                                enabled = connected && (fightRunning || result.isBlank()),
                                 modifier = Modifier.fillMaxWidth().height(76.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = Coral),
                                 shape = RoundedCornerShape(25.dp),
@@ -829,7 +1061,23 @@ private fun InteractionScreen(
                         }
                     }
                 }
-                if (result.isNotBlank()) item { GameResultCard(result, outcome, InteractionArt.Fight) }
+                if (result.isNotBlank()) {
+                    item { GameResultCard(result, outcome, InteractionArt.Fight) }
+                    item {
+                        Button(
+                            onClick = {
+                                result = ""
+                                userScore = 0
+                                robotScore = 0
+                                fightSeconds = 5
+                                fightResultSettled = false
+                            },
+                            enabled = connected && fightResultSettled,
+                            modifier = Modifier.fillMaxWidth().height(52.dp),
+                            shape = RoundedCornerShape(18.dp),
+                        ) { Text(if (fightResultSettled) "再来一局" else "正在确认本局结果") }
+                    }
+                }
             }
             InteractionSection.Dice -> {
                 item {
@@ -878,17 +1126,17 @@ private fun InteractionScreen(
 }
 
 @Composable
-private fun IllustratedMenuCard(
+private fun InteractionMenuTile(
     title: String,
-    subtitle: String,
     art: InteractionArt,
     color: Color,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(if (pressed) .965f else 1f, label = "menuPress")
     Card(
-        modifier = Modifier.fillMaxWidth()
+        modifier = modifier.height(154.dp)
             .graphicsLayer(scaleX = scale, scaleY = scale)
             .pointerInput(Unit) {
                 detectTapGestures(onPress = {
@@ -898,25 +1146,24 @@ private fun IllustratedMenuCard(
                     if (released) onClick()
                 })
             },
-        shape = RoundedCornerShape(28.dp),
+        shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = color),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Line.copy(alpha = .72f)),
     ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                Modifier.size(94.dp).background(Ink, RoundedCornerShape(25.dp)),
-                contentAlignment = Alignment.Center,
-            ) {
-                InteractionArtIcon(art, Color.White, Modifier.size(76.dp))
-            }
-            Spacer(Modifier.width(18.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 22.sp, fontWeight = FontWeight.Black, color = Ink)
-                Text(subtitle, color = SoftInk, fontSize = 13.sp)
-            }
-            MiniGlyph(GlyphKind.Right, true, Modifier.size(24.dp))
+        Box(Modifier.fillMaxSize().padding(15.dp)) {
+            Text(
+                title,
+                modifier = Modifier.align(Alignment.TopStart),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = Ink,
+                maxLines = 1,
+            )
+            InteractionArtIcon(
+                art,
+                Ink,
+                Modifier.align(Alignment.BottomEnd).size(94.dp),
+            )
         }
     }
 }
@@ -969,28 +1216,29 @@ private fun InteractionArtIcon(
     modifier: Modifier = Modifier,
 ) {
     val drawable = when (art) {
-        InteractionArt.Games -> R.drawable.interaction_games
-        InteractionArt.Poke -> R.drawable.interaction_poke
-        InteractionArt.Feed -> R.drawable.interaction_feed
-        InteractionArt.Rock -> R.drawable.game_rock
-        InteractionArt.Paper -> R.drawable.game_paper
-        InteractionArt.Scissors -> R.drawable.game_scissors
-        InteractionArt.Fight -> R.drawable.game_fight
-        InteractionArt.Dice -> R.drawable.interaction_dice
-        InteractionArt.Strawberry -> R.drawable.food_strawberry
-        InteractionArt.Apple -> R.drawable.food_apple
-        InteractionArt.Banana -> R.drawable.food_banana
-        InteractionArt.Cake -> R.drawable.food_cake
-        InteractionArt.Cookie -> R.drawable.food_cookie
-        InteractionArt.Bread -> R.drawable.food_bread
-        InteractionArt.RiceBall -> R.drawable.food_rice_ball
-        InteractionArt.IceCream -> R.drawable.food_ice_cream
-        InteractionArt.Milk -> R.drawable.drink_milk
-        InteractionArt.Juice -> R.drawable.drink_juice
-        InteractionArt.Water -> R.drawable.drink_water
-        InteractionArt.Yogurt -> R.drawable.drink_yogurt
-        InteractionArt.SoyMilk -> R.drawable.drink_soy_milk
-        InteractionArt.Cocoa -> R.drawable.drink_cocoa
+        InteractionArt.Games -> R.drawable.flat_interaction_games
+        InteractionArt.Poke -> R.drawable.flat_interaction_poke
+        InteractionArt.Feed -> R.drawable.flat_interaction_feed
+        InteractionArt.Guess -> R.drawable.game_action_guess
+        InteractionArt.Rock -> R.drawable.flat_game_rock
+        InteractionArt.Paper -> R.drawable.flat_game_paper
+        InteractionArt.Scissors -> R.drawable.flat_game_scissors
+        InteractionArt.Fight -> R.drawable.flat_game_fight
+        InteractionArt.Dice -> R.drawable.flat_interaction_dice
+        InteractionArt.Strawberry -> R.drawable.flat_food_strawberry
+        InteractionArt.Apple -> R.drawable.flat_food_apple
+        InteractionArt.Banana -> R.drawable.flat_food_banana
+        InteractionArt.Cake -> R.drawable.flat_food_cake
+        InteractionArt.Cookie -> R.drawable.flat_food_cookie
+        InteractionArt.Bread -> R.drawable.flat_food_bread
+        InteractionArt.RiceBall -> R.drawable.flat_food_rice_ball
+        InteractionArt.IceCream -> R.drawable.flat_food_ice_cream
+        InteractionArt.Milk -> R.drawable.flat_drink_milk
+        InteractionArt.Juice -> R.drawable.flat_drink_juice
+        InteractionArt.Water -> R.drawable.flat_drink_water
+        InteractionArt.Yogurt -> R.drawable.flat_drink_yogurt
+        InteractionArt.SoyMilk -> R.drawable.flat_drink_soy_milk
+        InteractionArt.Cocoa -> R.drawable.flat_drink_cocoa
     }
     Image(
         painter = painterResource(drawable),
@@ -1038,6 +1286,15 @@ private fun LegacyInteractionArtIcon(
     }
 
     when (art) {
+        InteractionArt.Guess -> {
+            rr(13f, 19f, 61f, 65f, 11f, Cream)
+            line(25f, 66f, 39f, 48f, 6f, Coral)
+            line(39f, 48f, 52f, 61f, 6f, CyanDeep)
+            line(52f, 61f, 66f, 36f, 6f, Ink)
+            circle(81f, 29f, 14f, Cyan)
+            line(79f, 24f, 84f, 28f, 4f, Ink)
+            circle(81f, 37f, 2.5f, Ink)
+        }
         InteractionArt.Games -> {
             dice(5, ink)
             circle(79f, 24f, 11f, Coral)
@@ -1175,9 +1432,9 @@ private fun ResultMark(outcome: Int, modifier: Modifier = Modifier) {
     Image(
         painter = painterResource(
             when {
-                outcome > 0 -> R.drawable.game_win
-                outcome < 0 -> R.drawable.game_lose
-                else -> R.drawable.interaction_dice
+                outcome > 0 -> R.drawable.flat_game_win
+                outcome < 0 -> R.drawable.flat_game_lose
+                else -> R.drawable.flat_interaction_dice
             },
         ),
         contentDescription = null,
@@ -1330,15 +1587,59 @@ private fun SettingsScreen(
     phase: ScanPhase,
     diagnostics: DiagnosticState,
     onPair: () -> Unit,
+    onNetwork: () -> Unit,
     onCharacter: () -> Unit,
+    onMemory: () -> Unit,
     onLab: () -> Unit,
     onVolume: (Int) -> Unit,
+    onSetupHotspot: (Boolean, (Boolean) -> Unit) -> Unit,
+    onRestart: ((Boolean) -> Unit) -> Unit,
     onBack: () -> Unit,
 ) {
     val connected = device != null && phase in setOf(ScanPhase.Connected, ScanPhase.Provisioned)
+    var confirmRestart by rememberSaveable { mutableStateOf(false) }
+    var restartAccepted by rememberSaveable { mutableStateOf(false) }
+    if (confirmRestart) {
+        AlertDialog(
+            onDismissRequest = { confirmRestart = false },
+            title = { Text("重新启动设备？") },
+            text = { Text("设备会先停车，然后重新启动头部软件。蓝牙会暂时断开，通常需要稍后重新连接。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmRestart = false
+                        onRestart { accepted -> restartAccepted = accepted }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Coral),
+                ) { Text("确认重新启动") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { confirmRestart = false }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
     DetailPage("设置", onBack) {
         item {
             SettingsRow("连接设备", if (connected) "已连接" else "未连接", GlyphKind.Pair, MintWash, onPair)
+        }
+        item {
+            val network = when (diagnostics.snapshot?.internetPhase) {
+                2 -> "已联网"
+                3 -> "需要登录"
+                4 -> "已断网"
+                else -> ""
+            }
+            SettingsRow("网络设置", network, GlyphKind.Signal, SkyWash, onNetwork)
+        }
+        item {
+            SetupHotspotSetting(
+                snapshot = diagnostics.snapshot,
+                enabled = connected && diagnostics.snapshot != null &&
+                    diagnostics.phase != DiagnosticPhase.Running,
+                onSetupHotspot = onSetupHotspot,
+            )
         }
         item {
             VolumeSetting(
@@ -1348,12 +1649,78 @@ private fun SettingsScreen(
             )
         }
         item {
-            SettingsRow("宝宝性格", "好奇心、亲近感和话语量", GlyphKind.Character,
+            SettingsRow("宝宝性格", "", GlyphKind.Character,
                 Lavender.copy(.48f), onCharacter)
         }
         item {
-            SettingsRow("功能检测", "屏幕、触摸、声音、灯光与底盘", GlyphKind.Lab,
+            SettingsRow("成长记忆", "", GlyphKind.Character,
+                MintWash, onMemory)
+        }
+        item {
+            SettingsRow("功能检测", "", GlyphKind.Lab,
                 Cream.copy(.55f), onLab)
+        }
+        item {
+            Button(
+                onClick = { confirmRestart = true },
+                enabled = connected && diagnostics.phase != DiagnosticPhase.Running,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(18.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Coral),
+            ) { Text(if (restartAccepted) "重新启动命令已发送" else "重新启动设备") }
+        }
+    }
+}
+
+@Composable
+private fun SetupHotspotSetting(
+    snapshot: DiagnosticSnapshot?,
+    enabled: Boolean,
+    onSetupHotspot: (Boolean, (Boolean) -> Unit) -> Unit,
+) {
+    var rejected by rememberSaveable { mutableStateOf(false) }
+    val checked = snapshot?.setupHotspotEnabled == true
+    val subtitle = when {
+        snapshot == null -> "连接设备并读取状态后可用"
+        rejected -> "操作未完成，请确认头部固件已更新"
+        !checked -> "已关闭 · 家庭 Wi-Fi 和云连接不受影响"
+        else -> "已开启 · 可连接 BabyTank 配网"
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(23.dp),
+        colors = CardDefaults.cardColors(containerColor = Paper),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 17.dp, vertical = 15.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.size(46.dp).background(SkyWash, RoundedCornerShape(15.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                MiniGlyph(GlyphKind.Signal, checked, Modifier.size(23.dp))
+            }
+            Spacer(Modifier.width(13.dp))
+            Column(Modifier.weight(1f)) {
+                Text("配网热点", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                Text(subtitle, color = SoftInk, fontSize = 12.sp)
+            }
+            Switch(
+                checked = checked,
+                enabled = enabled,
+                onCheckedChange = { target ->
+                    rejected = false
+                    onSetupHotspot(target) { accepted -> rejected = !accepted }
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Paper,
+                    checkedTrackColor = Ink,
+                    uncheckedThumbColor = SoftInk,
+                    uncheckedTrackColor = Paper,
+                    uncheckedBorderColor = Ink.copy(alpha = .18f),
+                ),
+            )
         }
     }
 }
@@ -1421,38 +1788,204 @@ private fun SettingsRow(
             Spacer(Modifier.width(13.dp))
             Column(Modifier.weight(1f)) {
                 Text(title, fontWeight = FontWeight.Black, fontSize = 16.sp)
-                Text(subtitle, color = SoftInk, fontSize = 12.sp)
+                if (subtitle.isNotBlank()) Text(subtitle, color = SoftInk, fontSize = 12.sp)
             }
             MiniGlyph(GlyphKind.Right, true, Modifier.size(18.dp))
         }
     }
 }
 
+private enum class PetNeedKind(val label: String, val glyph: GlyphKind) {
+    Food("饭饭", GlyphKind.Food),
+    Water("水水", GlyphKind.Water),
+    Energy("精神", GlyphKind.Sleep),
+}
+
+@Composable
+private fun PetNeedsCard(
+    hasState: Boolean,
+    hunger: Int,
+    thirst: Int,
+    energy: Int,
+    sleepy: Boolean,
+    sleeping: Boolean,
+    sleepBusy: Boolean,
+    onNeeds: () -> Unit,
+    onSleep: () -> Unit,
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Paper),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Line.copy(alpha = .62f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                PetNeedCell(
+                    kind = PetNeedKind.Food,
+                    wellbeing = 100 - hunger,
+                    hasState = hasState,
+                    urgent = hasState && hunger >= 50,
+                    modifier = Modifier.weight(1f),
+                    onClick = onNeeds,
+                )
+                PetNeedCell(
+                    kind = PetNeedKind.Water,
+                    wellbeing = 100 - thirst,
+                    hasState = hasState,
+                    urgent = hasState && thirst >= 50,
+                    modifier = Modifier.weight(1f),
+                    onClick = onNeeds,
+                )
+                PetNeedCell(
+                    kind = PetNeedKind.Energy,
+                    wellbeing = energy,
+                    hasState = hasState,
+                    urgent = sleepy,
+                    modifier = Modifier.weight(1f),
+                    onClick = onNeeds,
+                )
+            }
+            if (sleeping || sleepy) {
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    Modifier.fillMaxWidth()
+                        .background(if (sleeping) MintWash else ButterWash,
+                            RoundedCornerShape(18.dp))
+                        .padding(start = 13.dp, end = 7.dp, top = 7.dp, bottom = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    MiniGlyph(GlyphKind.Sleep, true, Modifier.size(21.dp), tint = Ink)
+                    Spacer(Modifier.width(9.dp))
+                    Text(
+                        if (sleeping) "睡得香香的" else "有点困了",
+                        modifier = Modifier.weight(1f),
+                        color = Ink,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp,
+                    )
+                    if (!sleeping) {
+                        Button(
+                            onClick = onSleep,
+                            enabled = !sleepBusy,
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Ink,
+                                contentColor = Color.White,
+                                disabledContainerColor = SoftInk,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 9.dp),
+                        ) {
+                            Text(if (sleepBusy) "哄睡中" else "去睡觉",
+                                fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PetNeedCell(
+    kind: PetNeedKind,
+    wellbeing: Int,
+    hasState: Boolean,
+    urgent: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    val active = if (hasState) ((wellbeing.coerceIn(0, 100) + 19) / 20) else 0
+    val accent = if (urgent) Coral else CyanDeep
+    Column(
+        modifier = modifier.clickable(enabled = hasState, onClick = onClick)
+            .padding(vertical = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier.size(34.dp).background(
+                if (urgent) PeachWash else MintWash,
+                CircleShape,
+            ),
+            contentAlignment = Alignment.Center,
+        ) {
+            MiniGlyph(kind.glyph, true, Modifier.size(19.dp), tint = accent)
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            repeat(5) { index ->
+                Box(
+                    Modifier.size(width = 10.dp, height = 5.dp).background(
+                        if (index < active) accent else Line,
+                        RoundedCornerShape(50),
+                    ),
+                )
+            }
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            if (!hasState) "—" else when {
+                urgent && kind == PetNeedKind.Food -> "饿了"
+                urgent && kind == PetNeedKind.Water -> "渴了"
+                urgent && kind == PetNeedKind.Energy -> "困了"
+                else -> kind.label
+            },
+            color = if (urgent) Coral else SoftInk,
+            fontSize = 11.sp,
+            fontWeight = if (urgent) FontWeight.Bold else FontWeight.Medium,
+        )
+    }
+}
+
+private enum class HomeArt { Chat, Memory, Drive, Play }
+
 @Composable
 private fun HomeActionCard(
     title: String,
-    subtitle: String,
     color: Color,
-    drawable: Int,
+    art: HomeArt,
     modifier: Modifier,
     onClick: () -> Unit,
 ) {
     Card(
-        modifier = modifier.height(172.dp).clickable(onClick = onClick),
-        shape = RoundedCornerShape(26.dp),
+        modifier = modifier.height(142.dp).clickable(onClick = onClick),
+        shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = color),
         border = androidx.compose.foundation.BorderStroke(1.dp, Line.copy(alpha = .55f)),
     ) {
         Box(Modifier.fillMaxSize()) {
-            Image(
-                painter = painterResource(drawable),
-                contentDescription = title,
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 6.dp).size(104.dp),
-                contentScale = ContentScale.Fit,
+            Text(
+                title,
+                Modifier.align(Alignment.TopStart).padding(15.dp),
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                color = Ink,
             )
-            Column(Modifier.align(Alignment.BottomStart).padding(16.dp)) {
-                Text(title, fontWeight = FontWeight.Bold, fontSize = 19.sp, color = Ink)
-                Text(subtitle, fontWeight = FontWeight.Medium, fontSize = 11.sp, color = SoftInk.copy(alpha = .72f))
+            when (art) {
+                HomeArt.Drive, HomeArt.Play -> Image(
+                    painter = painterResource(
+                        if (art == HomeArt.Drive) R.drawable.icon_home_drive_flat_generated
+                        else R.drawable.icon_home_play_flat_generated
+                    ),
+                    contentDescription = null,
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp).size(92.dp),
+                    contentScale = ContentScale.Fit,
+                )
+                HomeArt.Chat, HomeArt.Memory -> Box(
+                    Modifier.align(Alignment.BottomEnd).padding(15.dp).size(58.dp)
+                        .background(Ink, RoundedCornerShape(18.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    MiniGlyph(
+                        if (art == HomeArt.Chat) GlyphKind.Dialogue else GlyphKind.Character,
+                        true,
+                        Modifier.size(29.dp),
+                        tint = Color.White,
+                    )
+                }
             }
         }
     }
@@ -1463,18 +1996,11 @@ private fun PairScreen(
     phase: ScanPhase,
     devices: List<NearbyDevice>,
     detail: String?,
-    wifi: WifiDiscoveryState,
     selectedDevice: NearbyDevice?,
-    portal: PortalState,
     hasPermission: () -> Boolean,
     onScan: () -> Unit,
-    onRefreshWifi: () -> Unit,
-    onScanWifi: () -> Unit,
     onDevice: (NearbyDevice) -> Unit,
     onConnect: () -> Unit,
-    onProvision: (String, CharArray) -> Unit,
-    onOpenPortal: () -> Unit,
-    onClosePortal: () -> Unit,
     onBack: () -> Unit,
 ) {
     val permissions = remember {
@@ -1485,71 +2011,12 @@ private fun PairScreen(
                 add(Manifest.permission.BLUETOOTH_SCAN)
                 add(Manifest.permission.BLUETOOTH_CONNECT)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            }
         }.toTypedArray()
     }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
-        if (grants.values.all { it }) {
-            onRefreshWifi()
-            onScan()
-        }
-    }
-    var ssid by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var openNetwork by remember { mutableStateOf(false) }
-    var showPortal by remember { mutableStateOf(false) }
-
-    DisposableEffect(showPortal) {
-        onDispose { if (showPortal) onClosePortal() }
-    }
-    BackHandler(enabled = showPortal) {
-        showPortal = false
-        onClosePortal()
-    }
-
-    if (showPortal) {
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            OutlinedButton(
-                onClick = { showPortal = false; onClosePortal() },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("返回连接页") }
-            Text(portal.detail.ifBlank { "正在连接机器人热点…" },
-                color = SoftInk, modifier = Modifier.padding(vertical = 12.dp))
-            if (portal.connected) {
-                val context = LocalContext.current
-                val webView = remember {
-                    WebView(context).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = false
-                        settings.allowFileAccess = false
-                        settings.allowContentAccess = false
-                        webViewClient = WebViewClient()
-                        loadUrl("http://192.168.4.1/")
-                    }
-                }
-                DisposableEffect(webView) {
-                    onDispose { webView.destroy() }
-                }
-                AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
-            } else {
-                Button(
-                    onClick = onOpenPortal,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("已连接热点，打开配网页") }
-            }
-        }
-        return
-    }
-
-    LaunchedEffect(wifi.currentSsid) {
-        if (ssid.isBlank() && !wifi.currentSsid.isNullOrBlank() &&
-            !wifi.currentSsid.startsWith("BabyTank-", ignoreCase = true)) {
-            ssid = wifi.currentSsid
-        }
+        if (grants.values.all { it }) onScan()
     }
 
     DetailPage("连接设备", onBack) {
@@ -1557,7 +2024,6 @@ private fun PairScreen(
             Button(
                 onClick = {
                     if (hasPermission()) {
-                        onRefreshWifi()
                         onScan()
                     } else {
                         permissionLauncher.launch(permissions)
@@ -1569,8 +2035,10 @@ private fun PairScreen(
             ) {
                 Text(if (phase == ScanPhase.Scanning) "扫描中" else "扫描设备", fontWeight = FontWeight.Bold)
             }
-            if (detail != null) Text(detail, color = Coral, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
-            if (wifi.error != null) Text(wifi.error, color = Coral, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            if (phase in setOf(ScanPhase.Failed, ScanPhase.BluetoothOff,
+                    ScanPhase.MissingPermission, ScanPhase.Unsupported) && detail != null) {
+                Text(detail, color = Coral, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            }
         }
         if (devices.isEmpty()) {
             item {
@@ -1578,7 +2046,8 @@ private fun PairScreen(
             }
         } else {
             items(devices, key = NearbyDevice::address) { device ->
-                DeviceCard(device, selectedDevice?.address == device.address) { onDevice(device) }
+                DeviceCard(device, selectedDevice?.address == device.address,
+                    devices.count { it.name == device.name } > 1) { onDevice(device) }
             }
         }
         item {
@@ -1589,112 +2058,90 @@ private fun PairScreen(
                 shape = RoundedCornerShape(18.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),
             ) {
-                Text(if (phase == ScanPhase.Connecting) "连接中" else "连接设备")
+                Text(when (phase) {
+                    ScanPhase.Connecting -> "连接中"
+                    ScanPhase.Connected, ScanPhase.Provisioned -> "设备已连接"
+                    else -> "连接设备"
+                })
             }
         }
-        item {
-            Text("家庭 Wi-Fi", fontSize = 18.sp, fontWeight = FontWeight.Black,
-                modifier = Modifier.padding(top = 8.dp))
-            Text("在手机填写密码，通过加密蓝牙发送。仅支持 2.4 GHz。",
-                color = SoftInk, fontSize = 12.sp)
-        }
-        item {
-            OutlinedButton(
-                onClick = onScanWifi,
-                enabled = phase == ScanPhase.Connected,
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-                shape = RoundedCornerShape(18.dp),
-            ) { Text(if (wifi.scanning) "扫描中" else "扫描 Wi-Fi") }
-        }
-        items(wifi.networks, key = { it }) { network ->
-            Card(
-                modifier = Modifier.fillMaxWidth().clickable(enabled = phase == ScanPhase.Connected &&
-                    !network.startsWith("BabyTank-", ignoreCase = true)) {
-                    ssid = network
-                    openNetwork = false
-                },
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(containerColor = if (ssid == network) MintWash else Paper),
-            ) { Text(network, Modifier.padding(16.dp), fontWeight = FontWeight.Bold) }
-        }
-        item {
-            OutlinedTextField(
-                value = ssid,
-                onValueChange = { ssid = it.take(32) },
-                label = { Text("Wi-Fi 名称") },
-                singleLine = true,
-                enabled = phase == ScanPhase.Connected,
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = password,
-                onValueChange = { password = it.take(64) },
-                label = { Text("Wi-Fi 密码") },
-                supportingText = {
-                    Text(if (openNetwork) "开放网络无需密码" else "至少 8 位；网页登录账号不填在这里")
-                },
-                singleLine = true,
-                enabled = phase == ScanPhase.Connected && !openNetwork,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth().clickable(enabled = phase == ScanPhase.Connected) {
-                    openNetwork = !openNetwork
-                    if (openNetwork) password = ""
-                },
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Checkbox(
-                    checked = openNetwork,
-                    onCheckedChange = {
-                        openNetwork = it
-                        if (it) password = ""
-                    },
-                    enabled = phase == ScanPhase.Connected,
-                )
-                Text("开放网络（无密码）", fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun NetworkSetupScreen(
+    portal: PortalState,
+    hasPermission: () -> Boolean,
+    onOpenPortal: () -> Unit,
+    onClosePortal: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
+    val permissions = remember {
+        buildList {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
             }
+        }.toTypedArray()
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted -> if (granted.values.all { it }) onOpenPortal() }
+    val openPortal = {
+        if (hasPermission()) onOpenPortal() else permissionLauncher.launch(permissions)
+    }
+    DisposableEffect(Unit) { onDispose { onClosePortal() } }
+
+    if (portal.connected) {
+        BackHandler { onClosePortal() }
+        Column(Modifier.fillMaxSize().background(CanvasWarm)) {
+            Row(Modifier.fillMaxWidth().padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = onClosePortal) { Text("返回") }
+                Spacer(Modifier.width(12.dp))
+                Text("设备配网页", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Ink)
+            }
+            val webView = remember {
+                WebView(context).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = false
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    webViewClient = WebViewClient()
+                    loadUrl("http://192.168.4.1/")
+                }
+            }
+            DisposableEffect(webView) { onDispose { webView.destroy() } }
+            AndroidView(factory = { webView }, modifier = Modifier.fillMaxWidth().weight(1f))
+        }
+        return
+    }
+
+    DetailPage("网络设置", onBack) {
+        item {
+            Button(
+                onClick = { context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) },
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Paper, contentColor = Ink),
+                shape = RoundedCornerShape(18.dp),
+            ) { Text("打开手机 Wi-Fi") }
+        }
+        item {
+            Text("先打开手机 Wi-Fi 并连接 BabyTank 热点，再回这里打开配网页。",
+                color = SoftInk, fontSize = 14.sp)
         }
         item {
             Button(
-                onClick = {
-                    onProvision(ssid.trim(), if (openNetwork) charArrayOf() else password.toCharArray())
-                    password = ""
-                },
-                enabled = phase == ScanPhase.Connected && ssid.isNotBlank() &&
-                    !ssid.startsWith("BabyTank-", ignoreCase = true) &&
-                    (openNetwork || password.length >= 8),
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = RoundedCornerShape(18.dp),
+                onClick = openPortal,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) {
-                Text(
-                    when (phase) {
-                        ScanPhase.Provisioning -> "连接中"
-                        ScanPhase.Provisioned -> "已连接"
-                        else -> "连接 Wi-Fi"
-                    },
-                )
-            }
-        }
-        item {
-            HorizontalDivider(Modifier.padding(vertical = 6.dp), color = Line)
-            Text("备用配网", fontSize = 16.sp, fontWeight = FontWeight.Black)
-            Text("先在系统 Wi-Fi 连接 BabyTank- 热点。设备热点保持加密。",
-                color = SoftInk, fontSize = 12.sp)
-            OutlinedButton(
-                onClick = { showPortal = true; onOpenPortal() },
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(46.dp),
                 shape = RoundedCornerShape(18.dp),
             ) { Text("打开设备配网页") }
+            if (portal.detail.isNotBlank()) {
+                Text(portal.detail, color = Coral, fontSize = 13.sp,
+                    modifier = Modifier.padding(top = 10.dp))
+            }
         }
     }
 }
@@ -1711,7 +2158,8 @@ private fun EmptyDeviceCard(scanning: Boolean) {
 }
 
 @Composable
-private fun DeviceCard(device: NearbyDevice, selected: Boolean, onClick: () -> Unit) {
+private fun DeviceCard(device: NearbyDevice, selected: Boolean,
+    showIdentifier: Boolean, onClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         shape = RoundedCornerShape(22.dp),
@@ -1720,14 +2168,15 @@ private fun DeviceCard(device: NearbyDevice, selected: Boolean, onClick: () -> U
     ) {
         Row(Modifier.padding(17.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(44.dp).background(Ink, RoundedCornerShape(14.dp)), contentAlignment = Alignment.Center) {
-                MiniGlyph(GlyphKind.Pair, true)
+                MiniGlyph(GlyphKind.Pair, true, tint = Color.White)
             }
             Spacer(Modifier.width(13.dp))
             Column(Modifier.weight(1f)) {
                 Text(device.name, fontWeight = FontWeight.Black)
-                Text(device.address, fontSize = 11.sp, color = SoftInk)
+                if (showIdentifier) Text(device.address.takeLast(5),
+                    fontSize = 11.sp, color = SoftInk)
             }
-            StatusPill("${device.rssi} dBm", if (device.rssi > -65) CyanDeep else Coral)
+            if (selected) StatusPill("已选择", CyanDeep)
         }
     }
 }
@@ -1738,6 +2187,7 @@ private fun ControlScreen(
     connectionPhase: ScanPhase,
     controlState: ControlLinkState,
     video: VideoState,
+    videoFrame: StateFlow<Bitmap?>,
     onOpenConnection: () -> Unit,
     hasWifiPermission: () -> Boolean,
     onConnectCamera: () -> Unit,
@@ -1797,16 +2247,13 @@ private fun ControlScreen(
             onConnectCamera()
         }
     }
-    LaunchedEffect(connected, controlState.phase) {
-        if (connected && controlState.phase in setOf(
-                ControlLinkPhase.Idle,
-                ControlLinkPhase.Unavailable,
-                ControlLinkPhase.Failed,
-            )
-        ) {
-            if (controlState.phase != ControlLinkPhase.Idle) delay(1500)
-            onVerifyControl()
-        }
+    LaunchedEffect(connected) {
+        /* Verify once when the remote opens. Retrying every time a failed
+         * response updated controlState created a permanent BLE loop while
+         * the chassis was powered off. Besides wasting radio time, those
+         * Testing/Failed transitions recomposed the video screen repeatedly.
+         * STOP remains available as the explicit, safe retry action. */
+        if (connected) onVerifyControl()
     }
     Box(
         Modifier.fillMaxSize().background(
@@ -1834,7 +2281,10 @@ private fun ControlScreen(
                 Text(
                     when {
                         video.phase == VideoPhase.Streaming && controlReady -> "可以出发"
-                        video.phase == VideoPhase.Streaming -> "底盘未连接"
+                        video.phase == VideoPhase.Streaming ->
+                            "画面已连接 · 底盘未连接，点停止重试"
+                        controlState.phase == ControlLinkPhase.Testing -> "正在检查底盘"
+                        controlState.phase == ControlLinkPhase.Failed -> controlState.detail
                         connected -> "正在准备画面"
                         else -> "等待连接"
                     },
@@ -1842,7 +2292,12 @@ private fun ControlScreen(
                 )
             }
             StatusPill(
-                if (controlReady) "遥控中" else "准备中",
+                when {
+                    controlReady -> "遥控中"
+                    controlState.phase == ControlLinkPhase.Testing -> "检测中"
+                    controlState.phase == ControlLinkPhase.Failed -> "底盘离线"
+                    else -> "准备中"
+                },
                 if (controlReady) Cyan else Coral,
             )
         }
@@ -1900,17 +2355,7 @@ private fun ControlScreen(
                     border = androidx.compose.foundation.BorderStroke(2.dp, Color.White.copy(.12f)),
                 ) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        val frame = video.frame
-                        if (frame != null) {
-                            Image(
-                                bitmap = frame.asImageBitmap(),
-                                contentDescription = "宝宝视角实时画面",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize(),
-                            )
-                        } else {
-                            BabyFace(Modifier.fillMaxSize(), connected = connected)
-                        }
+                        CameraFrame(videoFrame, connected)
                         if (video.phase != VideoPhase.Streaming) {
                             Button(
                                 onClick = {
@@ -1981,6 +2426,24 @@ private fun ControlScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CameraFrame(frameFlow: StateFlow<Bitmap?>, connected: Boolean) {
+    /* Keep high-frequency bitmap invalidation in this small recomposition
+     * scope. Direction controls, sliders and action buttons remain untouched
+     * when a new MJPEG frame arrives. */
+    val frame by frameFlow.collectAsStateWithLifecycle()
+    if (frame != null) {
+        Image(
+            bitmap = frame!!.asImageBitmap(),
+            contentDescription = "宝宝视角实时画面",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+    } else {
+        BabyFace(Modifier.fillMaxSize(), connected = connected)
     }
 }
 
@@ -2256,9 +2719,12 @@ private fun HardwareLabScreen(
     onLight: (Int) -> Unit,
     onSpeaker: (Int) -> Unit,
     onListen: () -> Unit,
+    onStopListen: () -> Unit,
     onBack: () -> Unit,
 ) {
     val online = device != null
+    val snapshot = diagnostics.snapshot
+    val conversationActive = (snapshot?.conversationPhase ?: 0) in 1..5
     DetailPage(
         title = "功能检测",
         onBack = onBack,
@@ -2323,14 +2789,14 @@ private fun HardwareLabScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = Ink),
                 ) { Text("提示音") }
                 OutlinedButton(
-                    onClick = onListen, enabled = online,
+                    onClick = if (conversationActive) onStopListen else onListen,
+                    enabled = online,
                     modifier = Modifier.weight(1f), shape = RoundedCornerShape(16.dp),
-                ) { Text("开始对话") }
+                ) { Text(if (conversationActive) "结束对话" else "开始对话") }
             }
         }
     }
     item {
-        val snapshot = diagnostics.snapshot
         LabPanel("触摸", "触摸设备后点刷新") {
             listOf("顶部", "左侧", "右侧").forEachIndexed { index, name ->
                 val active = snapshot?.touchActiveMask?.and(1 shl index) != 0
@@ -2417,18 +2883,16 @@ private fun MetricRow(label: String, value: String, good: Boolean) {
 @Composable
 private fun CharacterScreen(
     device: NearbyDevice?,
-    connectionPhase: ScanPhase,
-    syncStatus: String,
+    state: ParentMemoryState,
     onSync: (Int, Int, Int) -> Unit,
     onBack: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val preferences = remember(context) {
-        context.getSharedPreferences("baby_tank_personality", 0)
-    }
-    var curiosity by remember { mutableFloatStateOf(preferences.getInt("curiosity", 78) / 100f) }
-    var warmth by remember { mutableFloatStateOf(preferences.getInt("warmth", 84) / 100f) }
-    var talkative by remember { mutableFloatStateOf(preferences.getInt("talkative", 46) / 100f) }
+    var curiosity by remember(state.personality.revision) {
+        mutableFloatStateOf(state.personality.curiosity / 100f) }
+    var warmth by remember(state.personality.revision) {
+        mutableFloatStateOf(state.personality.warmth / 100f) }
+    var talkative by remember(state.personality.revision) {
+        mutableFloatStateOf(state.personality.talkativeness / 100f) }
     DetailPage("我的宝宝", onBack) {
         item {
             Card(shape = RoundedCornerShape(28.dp), colors = CardDefaults.cardColors(containerColor = Ink)) {
@@ -2441,29 +2905,25 @@ private fun CharacterScreen(
                 }
             }
         }
-        item { TraitSlider("好奇心", curiosity) {
-            curiosity = it
-            preferences.edit().putInt("curiosity", (it * 100).toInt()).apply()
-        } }
-        item { TraitSlider("亲近感", warmth) {
-            warmth = it
-            preferences.edit().putInt("warmth", (it * 100).toInt()).apply()
-        } }
-        item { TraitSlider("话语量", talkative) {
-            talkative = it
-            preferences.edit().putInt("talkative", (it * 100).toInt()).apply()
-        } }
+        item { TraitSlider("好奇心", curiosity) { curiosity = it } }
+        item { TraitSlider("亲近感", warmth) { warmth = it } }
+        item { TraitSlider("话语量", talkative) { talkative = it } }
         item {
             Button(
                 onClick = { onSync((curiosity * 100).toInt(),
                                    (warmth * 100).toInt(),
                                    (talkative * 100).toInt()) },
-                enabled = connectionPhase in setOf(ScanPhase.Connected, ScanPhase.Provisioned),
+                enabled = state.pairedDeviceId != null && !state.busy,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(18.dp),
-            ) { Text("同步") }
+            ) { Text("保存到云端") }
         }
-        item { Text(syncStatus, color = SoftInk, fontSize = 12.sp) }
+        item { Text(if (state.headFresh &&
+            state.headPersonalityRevision == state.personality.revision)
+            "头部已确认版本 ${state.personality.revision}"
+            else "云端版本 ${state.personality.revision}；等待头部同步",
+            color = SoftInk, fontSize = 12.sp) }
+        if (state.error != null) item { Text(state.error, color = SoftInk, fontSize = 12.sp) }
     }
 }
 

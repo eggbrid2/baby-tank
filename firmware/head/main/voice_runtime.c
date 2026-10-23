@@ -13,6 +13,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
@@ -26,15 +27,20 @@
 #include "cloud_client.h"
 #include "chassis_bridge.h"
 #include "camera_stream.h"
+#include "runtime_policy.h"
 #include "conversation.h"
 #include "face_controller.h"
 #include "network_runtime.h"
+#include "interaction_memory.h"
 
 #define VOICE_MAX_UTTERANCE_SECONDS 12U
 #define VOICE_MAX_UTTERANCE_SAMPLES \
     (BABY_TANK_AUDIO_SAMPLE_RATE * VOICE_MAX_UTTERANCE_SECONDS)
 #define VOICE_WAIT_FOR_SPEECH_MS 15000U
+#define VOICE_MIN_UTTERANCE_MS 1000U
 #define VOICE_END_SILENCE_MS 500U
+#define VOICE_ENERGY_END_SILENCE_MS 650U
+#define VOICE_ENERGY_MIN_SPEECH_MS 700U
 #define VOICE_STATE_LOCK_MS 50U
 #define VOICE_NETWORK_WAIT_MS 15000U
 #define VOICE_FEED_TASK_STACK 4096U
@@ -52,7 +58,9 @@
 #define VOICE_PCM_PLAYER_STACK 5120U
 #define VOICE_PCM_PLAYER_PRIORITY 6U
 #define VOICE_TOUCH_REACTION_COOLDOWN_MS 1200U
-#define VOICE_TOUCH_REACTION_RESET_MS 30000U
+#define VOICE_TOUCH_REACTION_RESET_MS 8000U
+#define VOICE_TOUCH_REACTION_MAX_PENDING 2U
+#define VOICE_TOUCH_RARE_ONE_IN 12U
 #define VOICE_FACE_CUE_LIMIT 3U
 #define VOICE_WAKE_CLIP_CHUNK_SAMPLES 256U
 #define VOICE_REMOTE_MODE_LEASE_US 5000000LL
@@ -82,6 +90,38 @@ extern const uint8_t touch_angrier_start[] asm("_binary_baby_tank_touch_getting_
 extern const uint8_t touch_angrier_end[] asm("_binary_baby_tank_touch_getting_angry_pcm_end");
 extern const uint8_t touch_stop_start[] asm("_binary_baby_tank_touch_stop_touching_pcm_start");
 extern const uint8_t touch_stop_end[] asm("_binary_baby_tank_touch_stop_touching_pcm_end");
+extern const uint8_t touch_left_ticklish_start[] asm("_binary_baby_tank_touch_left_ticklish_pcm_start");
+extern const uint8_t touch_left_ticklish_end[] asm("_binary_baby_tank_touch_left_ticklish_pcm_end");
+extern const uint8_t touch_left_again_start[] asm("_binary_baby_tank_touch_left_again_pcm_start");
+extern const uint8_t touch_left_again_end[] asm("_binary_baby_tank_touch_left_again_pcm_end");
+extern const uint8_t touch_left_found_me_start[] asm("_binary_baby_tank_touch_left_found_me_pcm_start");
+extern const uint8_t touch_left_found_me_end[] asm("_binary_baby_tank_touch_left_found_me_pcm_end");
+extern const uint8_t touch_left_itchy_start[] asm("_binary_baby_tank_touch_left_itchy_pcm_start");
+extern const uint8_t touch_left_itchy_end[] asm("_binary_baby_tank_touch_left_itchy_pcm_end");
+extern const uint8_t touch_left_comfy_start[] asm("_binary_baby_tank_touch_left_comfy_pcm_start");
+extern const uint8_t touch_left_comfy_end[] asm("_binary_baby_tank_touch_left_comfy_pcm_end");
+extern const uint8_t touch_left_like_you_start[] asm("_binary_baby_tank_touch_left_like_you_pcm_start");
+extern const uint8_t touch_left_like_you_end[] asm("_binary_baby_tank_touch_left_like_you_pcm_end");
+extern const uint8_t touch_right_who_start[] asm("_binary_baby_tank_touch_right_who_pcm_start");
+extern const uint8_t touch_right_who_end[] asm("_binary_baby_tank_touch_right_who_pcm_end");
+extern const uint8_t touch_right_not_startled_start[] asm("_binary_baby_tank_touch_right_not_startled_pcm_start");
+extern const uint8_t touch_right_not_startled_end[] asm("_binary_baby_tank_touch_right_not_startled_pcm_end");
+extern const uint8_t touch_right_too_start[] asm("_binary_baby_tank_touch_right_too_pcm_start");
+extern const uint8_t touch_right_too_end[] asm("_binary_baby_tank_touch_right_too_pcm_end");
+extern const uint8_t touch_right_again_start[] asm("_binary_baby_tank_touch_right_again_pcm_start");
+extern const uint8_t touch_right_again_end[] asm("_binary_baby_tank_touch_right_again_pcm_end");
+extern const uint8_t touch_right_one_more_start[] asm("_binary_baby_tank_touch_right_one_more_pcm_start");
+extern const uint8_t touch_right_one_more_end[] asm("_binary_baby_tank_touch_right_one_more_pcm_end");
+extern const uint8_t touch_right_watching_start[] asm("_binary_baby_tank_touch_right_watching_pcm_start");
+extern const uint8_t touch_right_watching_end[] asm("_binary_baby_tank_touch_right_watching_pcm_end");
+extern const uint8_t touch_rare_sneeze_start[] asm("_binary_baby_tank_touch_rare_sneeze_pcm_start");
+extern const uint8_t touch_rare_sneeze_end[] asm("_binary_baby_tank_touch_rare_sneeze_pcm_end");
+extern const uint8_t touch_rare_catch_me_start[] asm("_binary_baby_tank_touch_rare_catch_me_pcm_start");
+extern const uint8_t touch_rare_catch_me_end[] asm("_binary_baby_tank_touch_rare_catch_me_pcm_end");
+extern const uint8_t touch_rare_easter_egg_start[] asm("_binary_baby_tank_touch_rare_easter_egg_pcm_start");
+extern const uint8_t touch_rare_easter_egg_end[] asm("_binary_baby_tank_touch_rare_easter_egg_pcm_end");
+extern const uint8_t touch_rare_transform_start[] asm("_binary_baby_tank_touch_rare_transform_pcm_start");
+extern const uint8_t touch_rare_transform_end[] asm("_binary_baby_tank_touch_rare_transform_pcm_end");
 extern const uint8_t game_win_start[] asm("_binary_game_win_pcm_start");
 extern const uint8_t game_win_end[] asm("_binary_game_win_pcm_end");
 extern const uint8_t game_lose_start[] asm("_binary_game_lose_pcm_start");
@@ -100,6 +140,7 @@ typedef enum {
 typedef enum {
     VOICE_REQUEST_RECORDED_SPEECH = 0,
     VOICE_REQUEST_TOUCH_REACTION,
+    VOICE_REQUEST_CLOUD_TEXT,
 } voice_request_kind_t;
 
 typedef struct {
@@ -113,6 +154,7 @@ typedef struct {
     uint32_t turn_id;
     baby_tank_touch_reaction_t touch_side;
     uint8_t touch_stage;
+    char text_job_id[40];
 } voice_request_t;
 
 typedef struct {
@@ -146,7 +188,7 @@ typedef struct {
     atomic_uchar face_cue_count;
     uint8_t next_face_cue;
     baby_tank_cloud_drive_action_t *action;
-    bool action_started;
+    atomic_bool action_started;
     atomic_bool action_done;
     esp_err_t action_result;
     uint32_t action_epoch;
@@ -165,6 +207,8 @@ static int16_t *s_recording;
 static size_t s_recorded_samples;
 static uint32_t s_waited_ms;
 static uint32_t s_silence_ms;
+static uint32_t s_energy_quiet_ms;
+static uint32_t s_peak_frame_level;
 static uint32_t s_turn_id;
 static bool s_speech_started;
 static bool s_cancel_requested;
@@ -176,12 +220,16 @@ static int64_t s_listen_deadline_us;
 static int64_t s_ignore_capture_until_us;
 static TickType_t s_last_touch_reaction;
 static uint8_t s_touch_stage;
+static uint8_t s_last_touch_choice[2] = {UINT8_MAX, UINT8_MAX};
+static uint8_t s_last_touch_rare = UINT8_MAX;
 static bool s_touch_reaction_active;
 static voice_state_t s_state = VOICE_STATE_IDLE;
 /* Covers the whole model-owned drive/drawing interval. Unlike
  * s_explore_active, this remains true until the dialogue task has consumed
  * the action result and is ready to reopen the microphone. */
 static atomic_bool s_action_active;
+static atomic_bool s_drawing_active;
+static atomic_bool s_drawing_cancel;
 static atomic_bool s_explore_active;
 static atomic_bool s_explore_cancel;
 static atomic_bool s_wake_ack_busy;
@@ -228,6 +276,8 @@ static void reset_capture_locked(void)
     s_recorded_samples = 0U;
     s_waited_ms = 0U;
     s_silence_ms = 0U;
+    s_energy_quiet_ms = 0U;
+    s_peak_frame_level = 0U;
     s_speech_started = false;
     s_ignore_capture_until_us = 0;
     atomic_store(&s_capture_finished_us, 0);
@@ -271,10 +321,7 @@ static void enter_action_state(const char *kind)
 {
     atomic_store(&s_action_active, true);
     if (take_state_lock()) {
-        if (s_state == VOICE_STATE_SPEAKING ||
-            s_state == VOICE_STATE_PROCESSING) {
-            s_state = VOICE_STATE_ACTING;
-        }
+        s_state = VOICE_STATE_ACTING;
         xSemaphoreGive(s_state_mutex);
     }
     configure_wakenet(false);
@@ -330,36 +377,124 @@ esp_err_t baby_tank_voice_runtime_play_phrase(uint8_t phrase)
     return result;
 }
 
-static esp_err_t play_touch_reaction(uint8_t stage)
+typedef struct {
+    const uint8_t *start;
+    const uint8_t *end;
+    const char *label;
+    const char *emotion;
+    baby_tank_expression_t expression;
+    uint8_t intensity;
+} touch_clip_t;
+
+#define TOUCH_CLIP(start_name, end_name, clip_label, emotion_name, face, level) \
+    { start_name, end_name, clip_label, emotion_name, face, level }
+
+static const touch_clip_t TOUCH_LEFT_CLIPS[] = {
+    TOUCH_CLIP(touch_left_ticklish_start, touch_left_ticklish_end,
+               "left_ticklish", "laughing", BABY_TANK_EXPRESSION_LAUGHING, 84U),
+    TOUCH_CLIP(touch_left_again_start, touch_left_again_end,
+               "left_again", "happy", BABY_TANK_EXPRESSION_HAPPY, 80U),
+    TOUCH_CLIP(touch_left_found_me_start, touch_left_found_me_end,
+               "left_found_me", "surprised", BABY_TANK_EXPRESSION_SURPRISED, 82U),
+    TOUCH_CLIP(touch_left_itchy_start, touch_left_itchy_end,
+               "left_itchy", "shy", BABY_TANK_EXPRESSION_SHY, 76U),
+    TOUCH_CLIP(touch_left_comfy_start, touch_left_comfy_end,
+               "left_comfy", "love", BABY_TANK_EXPRESSION_LOVE, 78U),
+    TOUCH_CLIP(touch_left_like_you_start, touch_left_like_you_end,
+               "left_like_you", "love", BABY_TANK_EXPRESSION_LOVE, 86U),
+};
+
+static const touch_clip_t TOUCH_RIGHT_CLIPS[] = {
+    TOUCH_CLIP(touch_right_who_start, touch_right_who_end,
+               "right_who", "curious", BABY_TANK_EXPRESSION_CURIOUS, 80U),
+    TOUCH_CLIP(touch_right_not_startled_start, touch_right_not_startled_end,
+               "right_not_startled", "proud", BABY_TANK_EXPRESSION_PROUD, 84U),
+    TOUCH_CLIP(touch_right_too_start, touch_right_too_end,
+               "right_too", "surprised", BABY_TANK_EXPRESSION_SURPRISED, 78U),
+    TOUCH_CLIP(touch_right_again_start, touch_right_again_end,
+               "right_again", "annoyed", BABY_TANK_EXPRESSION_ANNOYED, 72U),
+    TOUCH_CLIP(touch_right_one_more_start, touch_right_one_more_end,
+               "right_one_more", "shy", BABY_TANK_EXPRESSION_SHY, 76U),
+    TOUCH_CLIP(touch_right_watching_start, touch_right_watching_end,
+               "right_watching", "proud", BABY_TANK_EXPRESSION_PROUD, 82U),
+};
+
+static const touch_clip_t TOUCH_RARE_CLIPS[] = {
+    TOUCH_CLIP(touch_rare_sneeze_start, touch_rare_sneeze_end,
+               "rare_sneeze", "dizzy", BABY_TANK_EXPRESSION_DIZZY, 92U),
+    TOUCH_CLIP(touch_rare_catch_me_start, touch_rare_catch_me_end,
+               "rare_catch_me", "laughing", BABY_TANK_EXPRESSION_LAUGHING, 94U),
+    TOUCH_CLIP(touch_rare_easter_egg_start, touch_rare_easter_egg_end,
+               "rare_easter_egg", "excited", BABY_TANK_EXPRESSION_EXCITED, 96U),
+    TOUCH_CLIP(touch_rare_transform_start, touch_rare_transform_end,
+               "rare_transform", "bubble", BABY_TANK_EXPRESSION_BUBBLE, 94U),
+};
+
+static const touch_clip_t TOUCH_ESCALATION_CLIPS[] = {
+    TOUCH_CLIP(touch_dont_start, touch_dont_end,
+               "slow_down", "surprised", BABY_TANK_EXPRESSION_SURPRISED, 82U),
+    TOUCH_CLIP(touch_angrier_start, touch_angrier_end,
+               "getting_angry", "annoyed", BABY_TANK_EXPRESSION_ANNOYED, 90U),
+    TOUCH_CLIP(touch_stop_start, touch_stop_end,
+               "stop_touching", "angry", BABY_TANK_EXPRESSION_ANGRY, 98U),
+};
+
+static uint8_t choose_non_repeating(size_t count, uint8_t *last)
 {
-    static const uint8_t *const starts[] = {
-        touch_huhu_start, touch_dont_start,
-        touch_angrier_start, touch_stop_start,
-    };
-    static const uint8_t *const ends[] = {
-        touch_huhu_end, touch_dont_end,
-        touch_angrier_end, touch_stop_end,
-    };
-    static const char *const emotions[] = {
-        "sleepy", "surprised", "annoyed", "angry",
-    };
-    static const uint8_t intensities[] = {65U, 82U, 90U, 98U};
-    if (stage >= 4U) return ESP_ERR_INVALID_ARG;
-    size_t bytes = (size_t)(ends[stage] - starts[stage]);
+    if (count <= 1U) return 0U;
+    uint8_t choice = (uint8_t)(esp_random() % count);
+    if (choice == *last) {
+        choice = (uint8_t)((choice + 1U + esp_random() % (count - 1U)) % count);
+    }
+    *last = choice;
+    return choice;
+}
+
+static const touch_clip_t *choose_touch_clip(
+    baby_tank_touch_reaction_t side, uint8_t stage)
+{
+    if (stage >= 2U) {
+        size_t escalation = stage - 2U;
+        if (escalation >= sizeof(TOUCH_ESCALATION_CLIPS) /
+                              sizeof(TOUCH_ESCALATION_CLIPS[0])) {
+            escalation = sizeof(TOUCH_ESCALATION_CLIPS) /
+                         sizeof(TOUCH_ESCALATION_CLIPS[0]) - 1U;
+        }
+        return &TOUCH_ESCALATION_CLIPS[escalation];
+    }
+    if (esp_random() % VOICE_TOUCH_RARE_ONE_IN == 0U) {
+        uint8_t choice = choose_non_repeating(
+            sizeof(TOUCH_RARE_CLIPS) / sizeof(TOUCH_RARE_CLIPS[0]),
+            &s_last_touch_rare);
+        return &TOUCH_RARE_CLIPS[choice];
+    }
+    const touch_clip_t *pool = side == BABY_TANK_TOUCH_REACTION_LEFT
+                                   ? TOUCH_LEFT_CLIPS : TOUCH_RIGHT_CLIPS;
+    size_t count = side == BABY_TANK_TOUCH_REACTION_LEFT
+                       ? sizeof(TOUCH_LEFT_CLIPS) / sizeof(TOUCH_LEFT_CLIPS[0])
+                       : sizeof(TOUCH_RIGHT_CLIPS) / sizeof(TOUCH_RIGHT_CLIPS[0]);
+    uint8_t side_index = side == BABY_TANK_TOUCH_REACTION_LEFT ? 0U : 1U;
+    uint8_t choice = choose_non_repeating(count,
+                                           &s_last_touch_choice[side_index]);
+    return &pool[choice];
+}
+
+static esp_err_t play_touch_reaction(baby_tank_touch_reaction_t side,
+                                     uint8_t stage)
+{
+    const touch_clip_t *clip = choose_touch_clip(side, stage);
+    size_t bytes = (size_t)(clip->end - clip->start);
     if (bytes < 3200U || bytes > 128000U || (bytes & 1U) != 0U) {
         return ESP_ERR_INVALID_SIZE;
     }
     set_phase(BABY_TANK_CONVERSATION_AI_SPEAKING);
     ESP_RETURN_ON_ERROR(baby_tank_conversation_set_ai_emotion(
-                            emotions[stage], intensities[stage]),
+                            clip->emotion, clip->intensity),
                         TAG, "touch emotion failed");
     const baby_tank_face_request_t face = {
-        .expression = stage == 0U ? BABY_TANK_EXPRESSION_SLEEPY :
-                      stage == 1U ? BABY_TANK_EXPRESSION_SURPRISED :
-                      stage == 2U ? BABY_TANK_EXPRESSION_ANNOYED :
-                                    BABY_TANK_EXPRESSION_ANGRY,
+        .expression = clip->expression,
         .duration_ms = (uint32_t)(bytes / 32U) + 1000U,
-        .intensity = intensities[stage],
+        .intensity = clip->intensity,
         .priority = BABY_TANK_FACE_PRIORITY_INTERACTION,
     };
     ESP_RETURN_ON_ERROR(baby_tank_face_submit(&face), TAG,
@@ -371,7 +506,7 @@ static esp_err_t play_touch_reaction(uint8_t stage)
     for (size_t offset = 0U; offset < bytes; offset += sizeof(chunk)) {
         size_t count = bytes - offset;
         if (count > sizeof(chunk)) count = sizeof(chunk);
-        memcpy(chunk, starts[stage] + offset, count);
+        memcpy(chunk, clip->start + offset, count);
         result = baby_tank_conversation_observe_tts_pcm16(
             chunk, count / sizeof(int16_t));
         if (result == ESP_OK) {
@@ -388,9 +523,11 @@ static esp_err_t play_touch_reaction(uint8_t stage)
         vTaskDelay(pdMS_TO_TICKS(VOICE_PLAYBACK_TAIL_MS));
     }
     baby_tank_audio_io_end_playback();
-    ESP_LOGI(TAG, "local touch reaction stage=%u emotion=%s audio_ms=%zu result=%s",
-             (unsigned)(stage + 1U), emotions[stage], bytes / 32U,
-             esp_err_to_name(result));
+    ESP_LOGI(TAG,
+             "local %s-touch reaction streak=%u clip=%s emotion=%s audio_ms=%zu result=%s",
+             side == BABY_TANK_TOUCH_REACTION_LEFT ? "left" : "right",
+             (unsigned)(stage + 1U), clip->label, clip->emotion,
+             bytes / 32U, esp_err_to_name(result));
     return result;
 }
 
@@ -423,7 +560,8 @@ static void complete_turn(void)
         xSemaphoreGive(s_state_mutex);
     }
     s_afe->reset_buffer(s_afe_data);
-    configure_wakenet(!listen_again && !atomic_load(&s_remote_mode));
+    configure_wakenet(!listen_again && !atomic_load(&s_remote_mode) &&
+                      !baby_tank_policy_is_locked());
     ESP_LOGI(TAG, "conversation turn complete next=%s session_active=%d",
              listen_again ? "listening" : "standby", listen_again ? 1 : 0);
     if (listen_again) {
@@ -443,15 +581,27 @@ static void complete_turn(void)
             snapshot.phase != BABY_TANK_CONVERSATION_IDLE) {
             set_phase(BABY_TANK_CONVERSATION_IDLE);
         }
-        baby_tank_cloud_voice_session_close();
+        /* Keep the authenticated voice transport warm in standby. Closing it
+         * here made every new wake pay the full TLS handshake again. Remote
+         * mode, deep-night lock, network failure and runtime stop still close
+         * it explicitly. */
     }
 }
 
 esp_err_t baby_tank_voice_runtime_request_listen(void)
 {
+    ESP_RETURN_ON_FALSE(!baby_tank_policy_is_locked(), ESP_ERR_INVALID_STATE,
+                        TAG, "voice wake blocked by deep-night policy");
     ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
                         TAG, "AI voice is paused in remote mode");
     if (atomic_load(&s_action_active)) {
+        if (atomic_load(&s_drawing_active)) {
+            /* A wake-word edge is not an explicit request to dismiss art.
+             * Keep the canvas and microphone ownership through its hold;
+             * the ordinary session resumes listening afterwards. */
+            ESP_LOGI(TAG, "wake ignored while AI drawing is displayed");
+            return ESP_OK;
+        }
         if (take_state_lock()) {
             s_pending_listen = true;
             s_session_active = true;
@@ -489,6 +639,11 @@ esp_err_t baby_tank_voice_runtime_request_listen(void)
     configure_wakenet(false);
     (void)baby_tank_face_set_standby(false);
     baby_tank_cloud_reset_cancel();
+    /* Never block the AFE consumer while an idle App-text request exits: doing
+     * so fills the microphone ring buffer and can discard the beginning of a
+     * child's question. The waiter is bounded to 250 ms server-side and owns
+     * its handle until it observes this cancellation flag. */
+    baby_tank_cloud_cancel_text_wait();
     /* Start TLS while the local wake phrase plays. The session remains open
      * across turns and closes when the 15-second conversation expires. */
     if (baby_tank_network_cloud_is_ready()) {
@@ -519,14 +674,103 @@ esp_err_t baby_tank_voice_runtime_request_listen(void)
     return ESP_OK;
 }
 
+esp_err_t baby_tank_voice_runtime_cancel_conversation(void)
+{
+    ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
+                        TAG, "voice conversation is unavailable in remote mode");
+    ESP_RETURN_ON_FALSE(s_state_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "voice runtime is not initialized");
+
+    /* This is an explicit user action, unlike a noisy second touch edge, so it
+     * is allowed to stop every foreground phase including ASR/TLS/TTS. */
+    atomic_store(&s_drawing_cancel, true);
+    baby_tank_face_cancel_drawing();
+    atomic_store(&s_explore_cancel, true);
+    (void)baby_tank_chassis_bridge_stop();
+    ESP_RETURN_ON_FALSE(take_state_lock(), ESP_ERR_TIMEOUT, TAG,
+                        "voice state is busy");
+    s_session_active = false;
+    s_pending_listen = false;
+    s_cancel_requested = true;
+    s_state = VOICE_STATE_IDLE;
+    reset_capture_locked();
+    xSemaphoreGive(s_state_mutex);
+
+    baby_tank_cloud_cancel_current();
+    baby_tank_cloud_voice_session_close();
+    baby_tank_audio_io_end_playback();
+    if (s_afe != NULL && s_afe_data != NULL) s_afe->reset_buffer(s_afe_data);
+    set_phase(BABY_TANK_CONVERSATION_IDLE);
+    configure_wakenet(!baby_tank_policy_is_locked());
+    (void)baby_tank_face_set_standby(false);
+    (void)baby_tank_face_note_activity();
+    ESP_LOGI(TAG, "conversation cancelled by App; WakeNet restored");
+    return ESP_OK;
+}
+
+bool baby_tank_voice_runtime_can_accept_text(void)
+{
+    if (baby_tank_policy_is_locked() || atomic_load(&s_remote_mode) ||
+        atomic_load(&s_dialogue_busy) || atomic_load(&s_action_active) ||
+        s_state_mutex == NULL || s_utterance_queue == NULL ||
+        !take_state_lock()) return false;
+    bool available = s_state == VOICE_STATE_IDLE &&
+        uxQueueMessagesWaiting(s_utterance_queue) == 0U;
+    xSemaphoreGive(s_state_mutex);
+    return available;
+}
+
+esp_err_t baby_tank_voice_runtime_request_cloud_text(const char *job_id)
+{
+    ESP_RETURN_ON_FALSE(job_id != NULL && strlen(job_id) == 36U &&
+                        baby_tank_voice_runtime_can_accept_text(),
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "typed turn cannot interrupt active interaction");
+    ESP_RETURN_ON_FALSE(take_state_lock(), ESP_ERR_TIMEOUT, TAG,
+                        "typed turn voice state busy");
+    if (s_state != VOICE_STATE_IDLE || baby_tank_policy_is_locked() ||
+        atomic_load(&s_remote_mode)) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    voice_request_t request = {
+        .kind = VOICE_REQUEST_CLOUD_TEXT,
+        .turn_id = ++s_turn_id,
+    };
+    snprintf(request.text_job_id, sizeof(request.text_job_id), "%s", job_id);
+    if (xQueueSend(s_utterance_queue, &request, 0) != pdTRUE) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
+    s_state = VOICE_STATE_PROCESSING;
+    s_session_active = false;
+    s_pending_listen = false;
+    s_cancel_requested = false;
+    atomic_store(&s_action_active, true);
+    xSemaphoreGive(s_state_mutex);
+    configure_wakenet(false);
+    s_afe->reset_buffer(s_afe_data);
+    baby_tank_cloud_reset_cancel();
+    (void)baby_tank_face_set_standby(false);
+    (void)baby_tank_face_note_activity();
+    set_phase(BABY_TANK_CONVERSATION_THINKING);
+    ESP_LOGI(TAG, "cloud text turn accepted turn=%lu",
+             (unsigned long)request.turn_id);
+    return ESP_OK;
+}
+
 esp_err_t baby_tank_voice_runtime_toggle_listen(void)
 {
+    ESP_RETURN_ON_FALSE(!baby_tank_policy_is_locked(), ESP_ERR_INVALID_STATE,
+                        TAG, "top touch blocked by deep-night policy");
     ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
                         TAG, "top touch is paused in remote mode");
     if (atomic_load(&s_action_active)) {
-        /* A deliberate top touch remains an emergency motor stop, but it
-         * becomes a deferred listen request instead of opening ASR in the
-         * middle of the action. Drawings finish their short bounded hold. */
+        /* Touch cancels a drawing hold or stops motion, then starts listening
+         * only after the action task has released voice ownership. */
+        if (atomic_load(&s_drawing_active)) {
+            atomic_store(&s_drawing_cancel, true);
+        }
         if (atomic_load(&s_explore_active)) {
             atomic_store(&s_explore_cancel, true);
             (void)baby_tank_chassis_bridge_stop();
@@ -554,31 +798,77 @@ esp_err_t baby_tank_voice_runtime_toggle_listen(void)
         return baby_tank_voice_runtime_request_listen();
     }
 
-    voice_state_t previous = s_state;
-    s_cancel_requested = true;
-    s_pending_listen = false;
-    s_session_active = false;
-    s_state = VOICE_STATE_IDLE;
-    reset_capture_locked();
+    voice_state_t current = s_state;
     xSemaphoreGive(s_state_mutex);
-
-    baby_tank_cloud_cancel_current();
-    if (!atomic_load(&s_dialogue_busy)) {
-        baby_tank_cloud_voice_session_close();
-    }
-    baby_tank_audio_io_end_playback();
-    s_afe->reset_buffer(s_afe_data);
-    configure_wakenet(true);
-    set_phase(BABY_TANK_CONVERSATION_CANCELLED);
-    set_phase(BABY_TANK_CONVERSATION_IDLE);
-    (void)baby_tank_face_note_activity();
-    ESP_LOGI(TAG, "top touch closed conversation from state=%d", previous);
+    /* A second capacitive edge while the child speaks can be genuine or
+     * coupled noise. Neither should discard a captured utterance. The
+     * session closes on the spoken rest command or its idle timeout. */
+    ESP_LOGI(TAG, "top touch ignored during conversation state=%d", current);
     return ESP_OK;
 }
 
 bool baby_tank_voice_runtime_remote_mode(void)
 {
     return atomic_load(&s_remote_mode);
+}
+
+void baby_tank_voice_runtime_enter_night_lock(void)
+{
+    atomic_store(&s_drawing_cancel, true);
+    baby_tank_face_cancel_drawing();
+    atomic_store(&s_explore_cancel, true);
+    (void)baby_tank_chassis_bridge_stop();
+    if (s_state_mutex != NULL && take_state_lock()) {
+        s_session_active = false;
+        s_pending_listen = false;
+        s_cancel_requested = true;
+        s_state = VOICE_STATE_IDLE;
+        reset_capture_locked();
+        xSemaphoreGive(s_state_mutex);
+    }
+    baby_tank_cloud_cancel_current();
+    baby_tank_cloud_voice_session_close();
+    configure_wakenet(false);
+    ESP_LOGW(TAG, "active child dialogue cancelled for deep-night lock");
+}
+
+void baby_tank_voice_runtime_exit_night_lock(void)
+{
+    if (!atomic_load(&s_remote_mode)) configure_wakenet(true);
+    ESP_LOGI(TAG, "deep-night lock ended; waiting for an explicit wake");
+}
+
+esp_err_t baby_tank_voice_runtime_request_sleep(void)
+{
+    /* Remote/video mode owns the camera and has torn down the voice runtime.
+     * Restore normal voice ownership first so the child can wake the robot
+     * again without reopening the App. */
+    if (atomic_load(&s_remote_mode)) {
+        ESP_RETURN_ON_ERROR(baby_tank_voice_runtime_set_remote_mode(false),
+                            TAG, "leave remote mode before sleep failed");
+    }
+
+    atomic_store(&s_drawing_cancel, true);
+    baby_tank_face_cancel_drawing();
+    atomic_store(&s_explore_cancel, true);
+    (void)baby_tank_chassis_bridge_stop();
+    if (s_state_mutex != NULL && take_state_lock()) {
+        s_session_active = false;
+        s_pending_listen = false;
+        s_cancel_requested = true;
+        s_state = VOICE_STATE_IDLE;
+        reset_capture_locked();
+        xSemaphoreGive(s_state_mutex);
+    }
+    baby_tank_cloud_cancel_current();
+    baby_tank_cloud_voice_session_close();
+    baby_tank_audio_io_end_playback();
+    set_phase(BABY_TANK_CONVERSATION_IDLE);
+    configure_wakenet(true);
+    ESP_RETURN_ON_ERROR(baby_tank_face_set_standby(true), TAG,
+                        "enter wakeable sleep failed");
+    ESP_LOGI(TAG, "wakeable sleep requested by App");
+    return ESP_OK;
 }
 
 static void remote_resume_task(void *argument)
@@ -623,6 +913,7 @@ static esp_err_t renew_remote_lease(void)
 
 esp_err_t baby_tank_voice_runtime_set_remote_mode(bool enabled)
 {
+    if (enabled && baby_tank_policy_is_locked()) return ESP_ERR_INVALID_STATE;
     if (s_mode_mutex == NULL) {
         s_mode_mutex = xSemaphoreCreateMutex();
         ESP_RETURN_ON_FALSE(s_mode_mutex != NULL, ESP_ERR_NO_MEM, TAG,
@@ -643,6 +934,7 @@ esp_err_t baby_tank_voice_runtime_set_remote_mode(bool enabled)
 
         atomic_store(&s_explore_cancel, true);
         baby_tank_chassis_bridge_stop();
+        (void)baby_tank_cloud_wait_text_idle(500U);
         baby_tank_cloud_cancel_current();
         baby_tank_audio_io_end_playback();
         set_phase(BABY_TANK_CONVERSATION_CANCELLED);
@@ -652,6 +944,7 @@ esp_err_t baby_tank_voice_runtime_set_remote_mode(bool enabled)
         if (result == ESP_OK) result = baby_tank_camera_stream_start();
         if (result != ESP_OK) {
             (void)baby_tank_camera_stream_stop();
+            baby_tank_network_release_camera_hotspot();
             atomic_store(&s_remote_mode, false);
             (void)baby_tank_voice_runtime_start();
             (void)esp_timer_stop(s_remote_lease_timer);
@@ -670,6 +963,7 @@ esp_err_t baby_tank_voice_runtime_set_remote_mode(bool enabled)
     }
     if (s_remote_lease_timer != NULL) (void)esp_timer_stop(s_remote_lease_timer);
     result = baby_tank_camera_stream_stop();
+    baby_tank_network_release_camera_hotspot();
     if (result == ESP_OK) result = baby_tank_voice_runtime_start();
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "AI mode restore failed: %s", esp_err_to_name(result));
@@ -834,11 +1128,11 @@ static void direct_action_group_task(void *argument)
 
 static void start_pending_action_group(pcm_sink_t *sink)
 {
-    if (sink == NULL || sink->action_started || sink->action == NULL ||
+    if (sink == NULL || sink->action == NULL ||
         !sink->action->approved || sink->action->explore ||
         sink->action->look || sink->action->draw ||
         atomic_load(&s_remote_mode)) return;
-    sink->action_started = true;
+    if (atomic_exchange(&sink->action_started, true)) return;
     sink->action_result = ESP_ERR_INVALID_STATE;
     sink->action_epoch = baby_tank_chassis_bridge_control_epoch();
     atomic_store(&sink->action_done, false);
@@ -858,7 +1152,10 @@ static void start_pending_action_group(pcm_sink_t *sink)
 
 static esp_err_t wait_for_pending_action_group(pcm_sink_t *sink)
 {
-    if (sink == NULL || !sink->action_started) return ESP_ERR_NOT_FOUND;
+    if (sink == NULL) return ESP_ERR_INVALID_ARG;
+    /* An ordinary answer has no chassis job; successful audio playback is
+     * still a successfully completed turn. */
+    if (!atomic_load(&sink->action_started)) return ESP_OK;
     uint32_t wait_ms = (uint32_t)sink->action->duration_ms + 2000U;
     while (!atomic_load(&sink->action_done) && wait_ms > 0U) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -879,6 +1176,8 @@ static esp_err_t wait_for_pending_action_group(pcm_sink_t *sink)
 esp_err_t baby_tank_voice_runtime_request_touch_reaction(
     baby_tank_touch_reaction_t side)
 {
+    ESP_RETURN_ON_FALSE(!baby_tank_policy_is_locked(), ESP_ERR_INVALID_STATE,
+                        TAG, "side touch blocked by deep-night policy");
     ESP_RETURN_ON_FALSE(!atomic_load(&s_remote_mode), ESP_ERR_INVALID_STATE,
                         TAG, "touch AI is paused in remote mode");
     ESP_RETURN_ON_FALSE(side == BABY_TANK_TOUCH_REACTION_LEFT ||
@@ -896,6 +1195,12 @@ esp_err_t baby_tank_voice_runtime_request_touch_reaction(
     if (s_state != VOICE_STATE_IDLE && !already_reacting) {
         xSemaphoreGive(s_state_mutex);
         return ESP_ERR_INVALID_STATE;
+    }
+    if (already_reacting &&
+        uxQueueMessagesWaiting(s_utterance_queue) >=
+            VOICE_TOUCH_REACTION_MAX_PENDING) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_ERR_TIMEOUT;
     }
     if (s_last_touch_reaction != 0 &&
         now - s_last_touch_reaction <
@@ -919,7 +1224,7 @@ esp_err_t baby_tank_voice_runtime_request_touch_reaction(
         xSemaphoreGive(s_state_mutex);
         return ESP_ERR_TIMEOUT;
     }
-    if (s_touch_stage < 3U) ++s_touch_stage;
+    if (s_touch_stage < 4U) ++s_touch_stage;
     s_last_touch_reaction = now;
     ++s_turn_id;
     s_touch_reaction_active = true;
@@ -936,6 +1241,7 @@ esp_err_t baby_tank_voice_runtime_request_touch_reaction(
     ESP_LOGI(TAG, "local %s-touch reaction turn=%lu stage=%u",
              side == BABY_TANK_TOUCH_REACTION_LEFT ? "left" : "right",
              (unsigned long)request.turn_id, (unsigned)(touch_stage + 1U));
+    (void)baby_tank_interaction_memory_note_poke();
     return ESP_OK;
 }
 
@@ -961,14 +1267,30 @@ static void finish_recording(void)
     size_t sample_count = s_recorded_samples;
     xSemaphoreGive(s_state_mutex);
     set_phase(BABY_TANK_CONVERSATION_THINKING);
-    ESP_LOGI(TAG, "captured utterance: %u ms",
+    ESP_LOGI(TAG, "captured utterance: %u ms peak_level=%lu vad_silence_ms=%lu quiet_ms=%lu",
              (unsigned)(sample_count * 1000U /
-                        BABY_TANK_AUDIO_SAMPLE_RATE));
+                        BABY_TANK_AUDIO_SAMPLE_RATE),
+             (unsigned long)s_peak_frame_level,
+             (unsigned long)s_silence_ms,
+             (unsigned long)s_energy_quiet_ms);
+}
+
+static uint32_t frame_mean_abs(const afe_fetch_result_t *result)
+{
+    if (result->data == NULL || result->data_size <= 0) return 0U;
+    size_t count = (size_t)result->data_size / sizeof(int16_t);
+    uint64_t sum = 0U;
+    for (size_t index = 0; index < count; ++index) {
+        int32_t sample = result->data[index];
+        sum += (uint32_t)(sample < 0 ? -sample : sample);
+    }
+    return count > 0U ? (uint32_t)(sum / count) : 0U;
 }
 
 static void process_listening_frame(const afe_fetch_result_t *result)
 {
     uint32_t duration_ms = frame_duration_ms(result->data_size);
+    uint32_t frame_level = frame_mean_abs(result);
     bool finish = false;
     bool timeout = false;
     bool just_started = false;
@@ -989,6 +1311,7 @@ static void process_listening_frame(const afe_fetch_result_t *result)
             just_started = true;
             turn_id = s_turn_id;
             s_silence_ms = 0U;
+            s_peak_frame_level = frame_level;
             if (result->vad_cache != NULL && result->vad_cache_size > 0) {
                 append_samples(result->vad_cache,
                                (size_t)result->vad_cache_size /
@@ -1008,8 +1331,32 @@ static void process_listening_frame(const afe_fetch_result_t *result)
         } else {
             s_silence_ms += duration_ms;
         }
+        if (frame_level > s_peak_frame_level) s_peak_frame_level = frame_level;
+        /* AFE VAD can remain in SPEECH on steady background noise. End a
+         * real utterance once the cleaned PCM is quiet relative to that
+         * utterance, without shortening softly spoken questions. */
+        uint32_t energy_floor = s_peak_frame_level / 8U;
+        if (energy_floor < 250U) energy_floor = 250U;
+        if (s_peak_frame_level >= 700U && frame_level < energy_floor) {
+            s_energy_quiet_ms += duration_ms;
+        } else {
+            s_energy_quiet_ms = 0U;
+        }
         finish = s_silence_ms >= VOICE_END_SILENCE_MS ||
+                 (s_recorded_samples >=
+                      BABY_TANK_AUDIO_SAMPLE_RATE *
+                          VOICE_ENERGY_MIN_SPEECH_MS / 1000U &&
+                  s_energy_quiet_ms >= VOICE_ENERGY_END_SILENCE_MS) ||
                  s_recorded_samples >= VOICE_MAX_UTTERANCE_SAMPLES;
+        /* Keep a very short utterance open long enough to reject an isolated
+         * noise spike, but never force a child who has finished speaking to
+         * fill a four-second recording. The no-speech listening deadline is
+         * independent and remains open for VOICE_WAIT_FOR_SPEECH_MS. */
+        if (s_recorded_samples <
+                BABY_TANK_AUDIO_SAMPLE_RATE * VOICE_MIN_UTTERANCE_MS / 1000U &&
+            s_recorded_samples < VOICE_MAX_UTTERANCE_SAMPLES) {
+            finish = false;
+        }
     }
     xSemaphoreGive(s_state_mutex);
 
@@ -1092,7 +1439,8 @@ static void voice_fetch_task(void *argument)
             xSemaphoreGive(s_state_mutex);
         }
         if (state == VOICE_STATE_IDLE &&
-            result->wakeup_state == WAKENET_DETECTED) {
+            result->wakeup_state == WAKENET_DETECTED &&
+            !baby_tank_policy_is_locked()) {
             ESP_LOGI(TAG, "WakeNet detected 喵喵同学");
             baby_tank_voice_runtime_request_listen();
         } else if (state == VOICE_STATE_LISTENING) {
@@ -1327,9 +1675,13 @@ static esp_err_t microphone_pcm_source(uint8_t *buffer, size_t capacity,
             return ESP_ERR_INVALID_STATE;
         }
         size_t available = s_recorded_samples - sink->uploaded_samples;
-        if (active && available > 0U) {
+        size_t limit = capacity / sizeof(int16_t);
+        /* During capture, wait for one full transport frame instead of
+         * sending whichever small AFE fragment happened to arrive first.
+         * Once VAD closes the utterance, immediately flush the final partial
+         * frame and then return the zero-length end marker. */
+        if (active && available > 0U && (available >= limit || finished)) {
             size_t count = available;
-            size_t limit = capacity / sizeof(int16_t);
             if (count > limit) count = limit;
             memcpy(buffer, s_recording + sink->uploaded_samples,
                    count * sizeof(int16_t));
@@ -1574,13 +1926,22 @@ static void dialogue_task(void *argument)
            pdTRUE) {
         if (atomic_load(&s_runtime_stopping)) break;
         atomic_store(&s_dialogue_busy, true);
+        const bool typed_turn = utterance.kind == VOICE_REQUEST_CLOUD_TEXT;
+        const bool user_turn = utterance.kind == VOICE_REQUEST_RECORDED_SPEECH ||
+                               typed_turn;
         if (cancellation_requested()) {
+            if (typed_turn) (void)baby_tank_cloud_complete_text_turn(
+                utterance.text_job_id, "blocked");
             complete_turn();
             goto dialogue_next;
         }
-        if (utterance.kind == VOICE_REQUEST_TOUCH_REACTION &&
-            !baby_tank_network_cloud_is_ready()) {
-            esp_err_t touch_result = play_touch_reaction(utterance.touch_stage);
+        /* Side touch is a local personality blind box. The first two touches
+         * draw non-repeating left/right reactions (with a rare surprise);
+         * a rapid third touch starts the bounded "please stop" escalation.
+         * It must stay independent of Wi-Fi, LLM and cloud TTS. */
+        if (utterance.kind == VOICE_REQUEST_TOUCH_REACTION) {
+            esp_err_t touch_result = play_touch_reaction(
+                utterance.touch_side, utterance.touch_stage);
             if (touch_result != ESP_OK) {
                 if (take_state_lock()) {
                     s_touch_reaction_active = false;
@@ -1604,12 +1965,16 @@ static void dialogue_task(void *argument)
         }
         baby_tank_cloud_reset_cancel();
         if (!baby_tank_network_cloud_is_ready()) {
+            if (typed_turn) (void)baby_tank_cloud_complete_text_turn(
+                utterance.text_job_id, "failed");
             dialogue_failure("cloud credentials", ESP_ERR_INVALID_STATE);
             goto dialogue_next;
         }
         esp_err_t result = baby_tank_network_wait_connected(
             VOICE_NETWORK_WAIT_MS);
         if (result != ESP_OK) {
+            if (typed_turn) (void)baby_tank_cloud_complete_text_turn(
+                utterance.text_job_id, "failed");
             dialogue_failure("network connection", result);
             goto dialogue_next;
         }
@@ -1639,6 +2004,36 @@ static void dialogue_task(void *argument)
                     conversation_metadata, conversation_face_cue,
                     pcm_tts_sink, &sink, &format,
                     &sample_rate, &drive_action);
+            } else if (typed_turn) {
+                result = baby_tank_cloud_converse_text_turn(
+                    utterance.text_job_id, conversation_metadata,
+                    conversation_face_cue, pcm_tts_sink, &sink, &format,
+                    &sample_rate, &drive_action);
+            } else {
+                result = baby_tank_cloud_converse_touch(
+                    utterance.touch_side == BABY_TANK_TOUCH_REACTION_LEFT,
+                    conversation_metadata, pcm_tts_sink, &sink, &format,
+                    &sample_rate);
+            }
+            if (user_turn && result == ESP_OK && drive_action.approved &&
+                !drive_action.explore && !drive_action.look && !drive_action.draw) {
+                /* HTTP headers and WebSocket reply metadata can become
+                 * visible after the first-PCM hook. Start once here as a
+                 * bounded fallback; start_pending_action_group is idempotent. */
+                if (!atomic_load(&sink.action_started)) {
+                    ESP_LOGW(TAG,
+                             "AI drive metadata arrived after first PCM trace=%s",
+                             drive_action.trace_id);
+                    start_pending_action_group(&sink);
+                }
+                if (!atomic_exchange(&sink.action_started, true)) {
+                    sink.action_result = ESP_ERR_INVALID_STATE;
+                    atomic_store(&sink.action_done, true);
+                    ESP_LOGW(TAG, "AI drive blocked before start trace=%s",
+                             drive_action.trace_id);
+                }
+            }
+            if (user_turn) {
                 if (result == ESP_OK && drive_action.approved &&
                     drive_action.look) {
                     uint8_t *jpeg = NULL;
@@ -1655,11 +2050,6 @@ static void dialogue_task(void *argument)
                     }
                     free(jpeg);
                 }
-            } else {
-                result = baby_tank_cloud_converse_touch(
-                    utterance.touch_side == BABY_TANK_TOUCH_REACTION_LEFT,
-                    conversation_metadata, pcm_tts_sink, &sink, &format,
-                    &sample_rate);
             }
             if (result == ESP_OK &&
                 (sink.has_tail || sink.received_bytes % sizeof(int16_t) != 0U)) {
@@ -1710,11 +2100,11 @@ static void dialogue_task(void *argument)
                 s_touch_reaction_active = false;
                 xSemaphoreGive(s_state_mutex);
             }
-            if (result != ESP_OK && sink.action_started) {
+            if (result != ESP_OK && atomic_load(&sink.action_started)) {
                 atomic_store(&s_explore_cancel, true);
                 (void)baby_tank_chassis_bridge_stop();
             }
-            if (sink.action_started) {
+            if (atomic_load(&sink.action_started)) {
                 enter_action_state("drive");
             }
             esp_err_t action_result = wait_for_pending_action_group(&sink);
@@ -1731,6 +2121,9 @@ static void dialogue_task(void *argument)
                 goto dialogue_next;
             }
             if (result != ESP_OK) {
+                if (typed_turn) (void)baby_tank_cloud_complete_text_turn(
+                    utterance.text_job_id,
+                    cancellation_requested() ? "blocked" : "failed");
                 dialogue_failure("cloud conversation", result);
                 goto dialogue_next;
             }
@@ -1745,19 +2138,32 @@ static void dialogue_task(void *argument)
              * action. This closes the mouth and starts the bounded face hold. */
             if (drive_action.approved &&
                 (drive_action.explore || drive_action.draw)) {
+                if (drive_action.draw) {
+                    atomic_store(&s_drawing_cancel, false);
+                    atomic_store(&s_drawing_active, true);
+                }
                 enter_action_state(drive_action.draw ? "drawing" : "exploration");
             }
-            set_phase(BABY_TANK_CONVERSATION_IDLE);
+            /* Keep the turn visibly owned until an optional drawing has
+             * finished its full hold. IDLE here let unrelated idle work
+             * treat the canvas as an interruptible standby frame. */
+            if (drive_action.draw) {
+                set_phase(BABY_TANK_CONVERSATION_THINKING);
+            }
             if (drive_action.approved && drive_action.explore &&
-                utterance.kind == VOICE_REQUEST_RECORDED_SPEECH) {
+                user_turn) {
                 ESP_LOGI(TAG, "AI exploration group approved trace=%s",
                          drive_action.trace_id);
                 execute_exploration(&drive_action);
             } else if (drive_action.approved && drive_action.draw &&
-                       utterance.kind == VOICE_REQUEST_RECORDED_SPEECH) {
+                       user_turn) {
                 baby_tank_drawing_t drawing = {0};
                 esp_err_t fetched = baby_tank_cloud_fetch_drawing(
                     drive_action.trace_id, &drawing);
+                if (fetched == ESP_OK &&
+                    (atomic_load(&s_drawing_cancel) || cancellation_requested())) {
+                    fetched = ESP_ERR_INVALID_STATE;
+                }
                 if (fetched == ESP_OK) {
                     fetched = baby_tank_face_submit_drawing(&drawing);
                 }
@@ -1767,21 +2173,25 @@ static void dialogue_task(void *argument)
                 }
                 ESP_LOGI(TAG, "AI drawing trace=%s result=%s",
                          drive_action.trace_id, esp_err_to_name(fetched));
+                if (fetched != ESP_OK) action_result = fetched;
                 if (fetched == ESP_OK) {
                     /* Hold the scene for its full duration before opening
                      * the microphone again. No extra frame buffer is used. */
                     TickType_t started = xTaskGetTickCount();
                     while (xTaskGetTickCount() - started <
                            pdMS_TO_TICKS(drawing.duration_ms)) {
-                        if (cancellation_requested()) {
+                        if (atomic_load(&s_drawing_cancel) ||
+                            cancellation_requested()) {
                             baby_tank_face_cancel_drawing();
                             break;
                         }
                         vTaskDelay(pdMS_TO_TICKS(50));
                     }
                 }
-            } else if (drive_action.approved && sink.action_started &&
-                utterance.kind == VOICE_REQUEST_RECORDED_SPEECH) {
+                atomic_store(&s_drawing_active, false);
+            } else if (drive_action.approved &&
+                atomic_load(&sink.action_started) &&
+                user_turn) {
                 const char *outcome = action_result == ESP_OK ? "completed" :
                                       action_result == ESP_ERR_INVALID_STATE ? "blocked" : "failed";
                 const char *reason = action_result == ESP_OK ? "stop_echo_ok" :
@@ -1795,6 +2205,16 @@ static void dialogue_task(void *argument)
                     ESP_LOGW(TAG, "AI drive report failed trace=%s: %s",
                              drive_action.trace_id, esp_err_to_name(reported));
                 }
+            }
+            set_phase(BABY_TANK_CONVERSATION_IDLE);
+            if (typed_turn) {
+                esp_err_t reported = baby_tank_cloud_complete_text_turn(
+                    utterance.text_job_id,
+                    cancellation_requested() ? "blocked" :
+                    action_result == ESP_OK ? "completed" : "failed");
+                if (reported != ESP_OK) ESP_LOGW(TAG,
+                    "typed turn completion report failed: %s",
+                    esp_err_to_name(reported));
             }
             if (utterance.kind == VOICE_REQUEST_RECORDED_SPEECH &&
                 take_state_lock()) {
@@ -1828,6 +2248,8 @@ esp_err_t baby_tank_voice_runtime_start(void)
     atomic_store(&s_runtime_stopping, false);
     atomic_store(&s_dialogue_busy, false);
     atomic_store(&s_action_active, false);
+    atomic_store(&s_drawing_active, false);
+    atomic_store(&s_drawing_cancel, false);
     s_state = VOICE_STATE_IDLE;
     s_cancel_requested = false;
     s_pending_listen = false;
@@ -1903,6 +2325,8 @@ esp_err_t baby_tank_voice_runtime_stop(void)
     size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     atomic_store(&s_runtime_stopping, true);
     atomic_store(&s_action_active, false);
+    atomic_store(&s_drawing_cancel, true);
+    baby_tank_face_cancel_drawing();
     atomic_store(&s_explore_cancel, true);
     (void)baby_tank_chassis_bridge_stop();
     baby_tank_cloud_cancel_current();

@@ -43,6 +43,7 @@ data class ControlLinkState(
 enum class DiagnosticPhase { Idle, Running, Ready, Failed }
 
 data class DiagnosticSnapshot(
+    val setupHotspotEnabled: Boolean = false,
     val wifiConnected: Boolean = false,
     val cloudReady: Boolean = false,
     val softApReady: Boolean = false,

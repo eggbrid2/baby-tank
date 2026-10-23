@@ -15,8 +15,10 @@
 
 - [`bringup/2026-10-16-baby-persona-touch-wake.md`](bringup/2026-10-16-baby-persona-touch-wake.md)：宝宝人格、触摸和本地唤醒。
 - [`bringup/2026-10-19-mood-standby-touch.md`](bringup/2026-10-19-mood-standby-touch.md)：慢心情、短时情绪、正常/无聊/睡觉状态和梦境短句。
+- [`bringup/2026-10-20-mood-and-state-system-design.md`](bringup/2026-10-20-mood-and-state-system-design.md)：数值心情、昼夜状态、深夜锁、云端/App 记忆辅助与待机场景设计；附宝宝坦克实物参考照片。**云端与 App 家长入口已实现首版，头部状态接管和场景画面仍未完成**。
 - [`bringup/2026-10-16-ai-face-control-contract.md`](bringup/2026-10-16-ai-face-control-contract.md)：AI 到表情系统的白名单边界。
 - [`bringup/2026-10-19-interaction-games-and-generated-art.md`](bringup/2026-10-19-interaction-games-and-generated-art.md)：喂食、戳一戳、小游戏和儿童视觉资产。
+- [`bringup/2026-10-22-short-interaction-food-poke.md`](bringup/2026-10-22-short-interaction-food-poke.md)：本次开机短期互动记忆、食物偏好、重复喂食与 App/实体戳一戳统一逻辑。
 
 ## 表情与屏幕
 
@@ -39,6 +41,9 @@
 
 ## Android、遥控与视频
 
+- [`bringup/2026-10-23-device-restart-and-night-entry.md`](bringup/2026-10-23-device-restart-and-night-entry.md)：App 安全重启设备入口、夜间冷启动策略同步与已锁定状态进入修复。
+- [`bringup/2026-10-23-runtime-self-recovery.md`](bringup/2026-10-23-runtime-self-recovery.md)：App、云端与头部固件的资源回收、超时、健康检查和分级自恢复；包含阈值风险与非实机验证边界。
+- [`bringup/2026-10-23-app-interaction-regressions.md`](bringup/2026-10-23-app-interaction-regressions.md)：猜画重开、摄像头吞吐回退与显式结束聆听的代码修复和非实机验证边界。
 - [`bringup/2026-10-16-android-ble-provisioning-control.md`](bringup/2026-10-16-android-ble-provisioning-control.md)：Android BLE 配网和控制基础。
 - [`bringup/2026-10-16-softap-camera-video.md`](bringup/2026-10-16-softap-camera-video.md)：机器人 SoftAP 与 MJPEG 视频。
 - [`bringup/2026-10-17-adjustable-remote-speed.md`](bringup/2026-10-17-adjustable-remote-speed.md)：遥控速度设置。

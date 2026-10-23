@@ -9,7 +9,8 @@ import { loadConfig } from './config.mjs';
 import { openDatabase } from './db.mjs';
 import { compareVersions, createSecretBox, hashPassword, hashToken, isSafeName, json, newToken, now, parseCookies, readBody, readJson, verifyPassword } from './lib.mjs';
 import { recognizeWithQwen, recognizeStreamWithQwen, requestChatCompletion, synthesizeWithVolcengine, validateChatMessages } from './adapters.mjs';
-import { conversationMessages, drawingMessages, explicitDrawIntent, explicitDriveIntent,
+import { conversationMessages, drawingMessages, driveDecisionMessages,
+  explicitDrawIntent, modelDriveSafetyReason, parseDriveDecision,
   explicitLookIntent, explicitSleepIntent, parseConversationReply,
   parseDrawingProposal } from './conversation.mjs';
 import { readConversationMemory, saveConversationMemory } from './conversation_memory.mjs';
@@ -17,7 +18,23 @@ import { attachVoiceSocket } from './voice_ws.mjs';
 import { explicitExploreIntent, parseVisionStep, visionPrompt, visionAnswerPrompt,
   EXPLORATION_MAX_STEPS, EXPLORATION_MAX_TOTAL_MS } from './exploration.mjs';
 import { rasterizeDrawing } from './drawing.mjs';
-import { DEFAULT_MOOD, advanceMood, moodHeaders, normalizeMood } from './mood.mjs';
+import { normalizeSketchJpeg, parseSketchGuess,
+  SKETCH_GUESS_PROMPT } from './sketch_guess.mjs';
+import { DEFAULT_MOOD, moodHeaders, normalizeMood, parseThought } from './mood.mjs';
+import { dreamDeckPrompt, fallbackDreamDeck,
+  tryParseDreamDeckReply } from './dream_deck.mjs';
+import { readCharacterState, recordCharacterEvent, setCharacterPolicy } from './character_state.mjs';
+import { readDeviceStateAck, recordDeviceStateAck } from './device_state_ack.mjs';
+import { bootstrapPersonalityFromDevice, readPersonality,
+  setPersonality } from './personality_state.mjs';
+import { addApprovedMemory, clearApprovedMemories, listApprovedMemories,
+  pruneExpiredMemories, relevantApprovedMemories, revokeApprovedMemory,
+  updateApprovedMemory } from './approved_memory.mjs';
+import { inferConversationNeedEvent, nightLockWindows } from './state_engine.mjs';
+import { archiveQuestion, deleteQuestion, listQuestions, pruneExpiredQuestions,
+  readQuestionHistoryPolicy, setQuestionHistoryPolicy } from './question_history.mjs';
+import { authenticateParent, claimParentAccess, createParentClaim,
+  revokeDeviceParents, revokeParentAccess } from './parent_access.mjs';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../public');
 const allowedProviders = {
@@ -55,19 +72,161 @@ export function createApp(config) {
   const db = openDatabase(config.dbPath, { username: config.adminUsername, password: config.adminPassword });
   const secrets = createSecretBox(config.masterKey);
   const loginAttempts = new Map();
+  const parentClaimAttempts = new Map();
+  const cloudRegistrationAttempts = new Map();
+  const cloudLoginAttempts = new Map();
   const conversationBusy = new Set();
   // Deliberately volatile: a restart cancels every autonomous group.
   const explorations = new Map();
   // A camera request is valid only for one authenticated, active dialogue turn.
   const visionSessions = new Map();
   const drawingSessions = new Map();
+  // Ephemeral relay: the App submits text to the cloud; the head claims the
+  // turn over its own Internet connection. A restart fails pending jobs
+  // visibly instead of replaying an old motor command.
+  const textTurns = new Map();
+  const textWaiters = new Map();
+  const sketchGuessLimits = new Map();
+  let voiceTransport = null;
+  const textTurnBlockingStatuses = new Set([
+    'queued', 'claimed', 'processing', 'waiting_vision',
+  ]);
+  const textTurnInFlightStatuses = new Set([
+    'claimed', 'processing', 'waiting_vision', 'reply_ready',
+  ]);
+  const textTurnActiveTimeoutMs = 150_000;
+  const textTurnCompletionTimeoutMs = 30_000;
+  const textTurnMaxPendingPerDevice = 4;
 
-  function rememberConversation(deviceId, userText, replyText) {
+  function pruneTextTurns() {
+    const current = Date.now();
+    for (const [id, turn] of textTurns) {
+      if (current > turn.expiresAt) textTurns.delete(id);
+      else if (turn.status === 'queued' && turn.claimDeadlineAt !== null &&
+          current > turn.claimDeadlineAt) {
+        turn.status = 'failed';
+        turn.error = 'device_offline';
+      } else if (['claimed', 'processing', 'waiting_vision'].includes(turn.status) &&
+          current > (turn.activeAt || turn.claimedAt || turn.submittedAt) +
+            textTurnActiveTimeoutMs) {
+        /* A lost device connection must not reserve the only App/guess turn
+         * for the full five-minute retention window. */
+        turn.status = 'failed';
+        turn.error = 'device_processing_timeout';
+      } else if (turn.status === 'reply_ready' &&
+          current > (turn.replyReadyAt || turn.activeAt || turn.submittedAt) +
+            textTurnCompletionTimeoutMs) {
+        /* Playback completion is best-effort. Keep the device serial for one
+         * bounded playback window, then release queued work if its ACK died. */
+        turn.status = 'failed';
+        turn.error = 'device_completion_timeout';
+      }
+    }
+  }
+
+  function inFlightTextTurn(deviceId) {
+    return [...textTurns.values()].find((turn) => turn.deviceId === deviceId &&
+      textTurnInFlightStatuses.has(turn.status));
+  }
+
+  function pendingTextTurnCount(deviceId) {
+    pruneTextTurns();
+    return [...textTurns.values()].filter((turn) => turn.deviceId === deviceId &&
+      textTurnBlockingStatuses.has(turn.status)).length;
+  }
+
+  function claimQueuedTextTurn(deviceId) {
+    if (inFlightTextTurn(deviceId)) return null;
+    const turn = [...textTurns.values()].find((item) =>
+      item.deviceId === deviceId && item.status === 'queued' &&
+      (item.claimDeadlineAt === null || Date.now() <= item.claimDeadlineAt));
+    if (turn) {
+      turn.status = 'claimed';
+      turn.claimedAt = Date.now();
+      turn.activeAt = turn.claimedAt;
+    }
+    return turn;
+  }
+
+  function dispatchNextTextTurn(deviceId) {
+    pruneTextTurns();
+    if (inFlightTextTurn(deviceId)) return false;
+    const turn = [...textTurns.values()].find((item) =>
+      item.deviceId === deviceId && item.status === 'queued');
+    if (!turn) return false;
+    turn.claimDeadlineAt ??= Date.now() + 10_000;
+    const warmSocket = voiceTransport?.notifyTextAvailable(deviceId, turn.id) === true;
+    if (warmSocket) return claimQueuedTextTurn(deviceId)?.id === turn.id;
+    const waiter = textWaiters.get(deviceId);
+    if (waiter && !waiter.res.destroyed) {
+      textWaiters.delete(deviceId);
+      clearTimeout(waiter.timer);
+      const claimed = claimQueuedTextTurn(deviceId);
+      if (claimed) json(waiter.res, 200, { id: claimed.id });
+      return claimed?.id === turn.id;
+    }
+    return false;
+  }
+
+  function pruneEphemeralState() {
+    const current = Date.now();
+    pruneTextTurns();
+    for (const attempts of [loginAttempts, parentClaimAttempts,
+      cloudRegistrationAttempts, cloudLoginAttempts, sketchGuessLimits]) {
+      for (const [key, value] of attempts) {
+        if (!value?.resetAt || current >= value.resetAt) attempts.delete(key);
+      }
+    }
+    for (const [key, value] of explorations) {
+      if (value.finished || current > value.expiresAt) explorations.delete(key);
+    }
+    for (const sessions of [visionSessions, drawingSessions]) {
+      for (const [key, value] of sessions) {
+        if (current > value.expiresAt) sessions.delete(key);
+      }
+    }
+  }
+
+  function rememberConversation(deviceId, userText, replyText, traceId = null,
+                                archiveSpeech = false) {
     try {
       saveConversationMemory(db, secrets, deviceId, userText, replyText);
     } catch (error) {
       // A storage outage must not cut off a reply whose TTS has started.
       console.error(`conversation memory persistence failed: ${error.message}`);
+    }
+    const kind = inferConversationNeedEvent(userText, replyText);
+    if (traceId && (kind || archiveSpeech)) {
+      // Never add another LLM round trip to the first-audio path.
+      setImmediate(() => {
+        try {
+          if (kind) recordCharacterEvent(db, deviceId,
+            { eventId: traceId, kind, source: 'conversation' });
+          if (archiveSpeech) archiveQuestion(db, secrets, deviceId,
+            traceId, userText, replyText);
+        } catch (error) {
+          console.error(`post-turn persistence failed: ${error.message}`);
+        }
+      });
+    }
+    // Build tonight's compact dream deck after the reply has left the
+    // critical path.  The sleeping head can then fetch it without waiting
+    // for another model call or interrupting its awake voice connection.
+    try {
+      const state = readCharacterState(db, deviceId);
+      if (['early_evening', 'evening', 'late_night'].includes(state.band)) {
+        const timer = setTimeout(async () => {
+          try {
+            const device = db.prepare('SELECT * FROM devices WHERE id=?').get(deviceId);
+            if (device) await dreamDeckFor(device);
+          } catch (error) {
+            console.error(`dream deck warm-up failed: ${error.message}`);
+          }
+        }, 1500);
+        timer.unref?.();
+      }
+    } catch (error) {
+      console.error(`dream deck warm-up scheduling failed: ${error.message}`);
     }
   }
 
@@ -75,22 +234,35 @@ export function createApp(config) {
     const row = db.prepare(`SELECT valence,arousal,dominance,label,intensity,
       thought_key,thought_ciphertext,updated_at FROM device_mood_state
       WHERE device_id=?`).get(deviceId);
-    if (!row) return normalizeMood(DEFAULT_MOOD);
-    let thought = { key: row.thought_key, text: '' };
-    try {
-      const decrypted = secrets.decrypt(row.thought_ciphertext);
+    let thought = DEFAULT_MOOD.thought;
+    if (row) {
       try {
-        const stored = JSON.parse(decrypted);
-        thought = { key: row.thought_key, text: stored.text,
-          displayText: stored.displayText };
-      } catch {
-        thought.text = decrypted;
-      }
-    } catch {}
-    return normalizeMood({ valence: row.valence, arousal: row.arousal,
-      dominance: row.dominance, label: row.label, intensity: row.intensity,
-      thought,
-      updatedAt: row.updated_at });
+        const decrypted = secrets.decrypt(row.thought_ciphertext);
+        try {
+          const stored = JSON.parse(decrypted);
+          thought = { key: row.thought_key, text: stored.text,
+            displayText: stored.displayText };
+        } catch { thought = { key: row.thought_key, text: decrypted }; }
+      } catch {}
+    }
+    const character = readCharacterState(db, deviceId);
+    // Legacy PAD fields remain in the v1 device contract, but their values
+    // now derive only from persisted needs and time. The model's sentence
+    // emotion is a short presentation cue, not a long-lived mood update.
+    return normalizeMood({
+      valence: character.derived.comfort * 2 - 100,
+      arousal: character.derived.activation * 2 - 100,
+      dominance: character.derived.spirit * 2 - 100,
+      label: character.mood,
+      intensity: 40 + Math.round(Math.abs(character.derived.comfort - 50) / 3),
+      thought, updatedAt: now(),
+    });
+  }
+
+  function moodAfterReply(deviceId, thoughtValue) {
+    const current = readMoodState(deviceId);
+    return normalizeMood({ ...current,
+      thought: parseThought(thoughtValue, current.label), updatedAt: now() });
   }
 
   function saveMoodState(deviceId, traceId, source, triggerEmotion,
@@ -168,6 +340,21 @@ export function createApp(config) {
       .get(hashToken(token), now()) || null;
   }
 
+  function cloudSession(req) {
+    const token = parseCookies(req.headers.cookie).bt_cloud_session;
+    if (!token) return null;
+    return db.prepare(`SELECT s.token_hash,s.csrf_token,s.expires_at,
+      a.id AS account_id,a.email,a.display_name,a.email_verified_at
+      FROM cloud_sessions s JOIN cloud_accounts a ON a.id=s.account_id
+      WHERE s.token_hash=? AND s.expires_at>? AND a.status='active'`)
+      .get(hashToken(token), now()) || null;
+  }
+
+  function publicCloudAccount(session) {
+    return { id: session.account_id, email: session.email,
+      displayName: session.display_name, emailVerified: Boolean(session.email_verified_at) };
+  }
+
   function requireAdmin(req, res, write = false) {
     const session = adminSession(req);
     if (!session) {
@@ -179,6 +366,32 @@ export function createApp(config) {
       return null;
     }
     return session;
+  }
+
+  function serveFirmware(req, res, row, cacheControl) {
+    let stat;
+    try { stat = statSync(row.file_path); } catch {
+      return json(res, 404, { error: 'firmware_file_missing' });
+    }
+    const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
+    const start = range ? Number(range[1]) : 0;
+    const end = range && range[2] ? Math.min(Number(range[2]), stat.size - 1) : stat.size - 1;
+    if (start < 0 || start > end || start >= stat.size) {
+      res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
+      return res.end();
+    }
+    const partial = Boolean(range);
+    const headers = {
+      'content-type': 'application/octet-stream',
+      'content-length': end - start + 1,
+      'accept-ranges': 'bytes',
+      'content-disposition': `attachment; filename="${row.file_name}"`,
+      'x-firmware-sha256': row.sha256,
+      'cache-control': cacheControl,
+    };
+    if (partial) headers['content-range'] = `bytes ${start}-${end}/${stat.size}`;
+    res.writeHead(partial ? 206 : 200, headers);
+    return createReadStream(row.file_path, { start, end }).pipe(res);
   }
 
   function authenticateDeviceAuthorization(value) {
@@ -210,6 +423,15 @@ export function createApp(config) {
     return device;
   }
 
+  function requireParent(req, res) {
+    const parent = authenticateParent(db, req.headers.authorization);
+    if (!parent) {
+      json(res, 401, { error: 'parent_authentication_required' });
+      return null;
+    }
+    return parent;
+  }
+
   function publicUrl(req) {
     if (config.publicBaseUrl) return config.publicBaseUrl;
     return `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`;
@@ -217,6 +439,67 @@ export function createApp(config) {
 
   function activeProvider(kind) {
     return db.prepare('SELECT * FROM provider_configs WHERE kind=? AND enabled=1 ORDER BY updated_at DESC LIMIT 1').get(kind);
+  }
+
+  function localDay(timeZone, at = new Date()) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone,
+        year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(at);
+      const part = (type) => parts.find((item) => item.type === type)?.value;
+      return `${part('year')}-${part('month')}-${part('day')}`;
+    } catch {
+      return at.toISOString().slice(0, 10);
+    }
+  }
+
+  async function dreamDeckFor(device) {
+    const character = readCharacterState(db, device.id);
+    const day = localDay(character.policy.timeZone);
+    const cached = db.prepare(`SELECT entries_json,source,generated_at
+      FROM device_dream_decks WHERE device_id=? AND local_day=?`)
+      .get(device.id, day);
+    if (cached) {
+      try {
+        const entries = JSON.parse(cached.entries_json);
+        if (Array.isArray(entries) && entries.length === 30) {
+          return { day, entries, source: cached.source,
+            generatedAt: cached.generated_at };
+        }
+      } catch {}
+    }
+
+    const seed = `${device.device_id}:${day}`;
+    let entries = fallbackDreamDeck(seed);
+    let source = 'fallback';
+    const llm = activeProvider('llm');
+    if (llm) {
+      try {
+        const response = await requestChatCompletion({ selected: llm,
+          credentials: providerCredentials(llm), request: {
+            messages: dreamDeckPrompt(character.mood, character.band),
+            stream: false, temperature: 0.65, max_tokens: 512,
+          }, timeoutMs: 20_000 });
+        if (response.ok) {
+          const body = await response.json();
+          const generated = tryParseDreamDeckReply(
+            body?.choices?.[0]?.message?.content);
+          if (generated) {
+            entries = generated;
+            source = 'ai';
+          }
+        }
+      } catch (error) {
+        console.error(`dream deck generation deferred: ${error.message}`);
+      }
+    }
+    const generatedAt = now();
+    db.prepare(`INSERT INTO device_dream_decks
+      (device_id,local_day,entries_json,source,generated_at) VALUES (?,?,?,?,?)
+      ON CONFLICT(device_id) DO UPDATE SET local_day=excluded.local_day,
+      entries_json=excluded.entries_json,source=excluded.source,
+      generated_at=excluded.generated_at`).run(device.id, day,
+      JSON.stringify(entries), source, generatedAt);
+    return { day, entries, source, generatedAt };
   }
 
   function providerCredentials(selected) {
@@ -229,18 +512,463 @@ export function createApp(config) {
 
   async function handleApi(req, res, url) {
     if (req.method === 'GET' && url.pathname === '/healthz') {
-      return json(res, 200, { status: 'ok', service: 'baby-tank-cloud', time: now() });
+      try {
+        db.prepare('SELECT 1 AS healthy').get();
+        return json(res, 200, { status: 'ok', service: 'baby-tank-cloud',
+          time: now() });
+      } catch {
+        return json(res, 503, { status: 'unhealthy', service: 'baby-tank-cloud' });
+      }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/public/v1/releases') {
+      const releases = db.prepare(`SELECT id,version,board,file_name AS fileName,
+        byte_size AS byteSize,sha256,notes,chip,secure_version AS secureVersion,
+        created_at AS createdAt FROM firmware
+        WHERE channel='stable' AND published=1 ORDER BY created_at DESC LIMIT 20`).all()
+        .map((release) => ({ ...release,
+          downloadUrl: `/api/public/v1/releases/${release.id}/download` }));
+      return json(res, 200, { releases }, { 'cache-control': 'public, max-age=60' });
+    }
+
+    const publicDownloadMatch = url.pathname.match(/^\/api\/public\/v1\/releases\/(\d+)\/download$/);
+    if (req.method === 'GET' && publicDownloadMatch) {
+      const row = db.prepare(`SELECT * FROM firmware
+        WHERE id=? AND channel='stable' AND published=1`).get(Number(publicDownloadMatch[1]));
+      if (!row) return json(res, 404, { error: 'firmware_not_found' });
+      return serveFirmware(req, res, row, 'public, max-age=3600, immutable');
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/cloud/v1/register') {
+      const ip = req.socket.remoteAddress || 'unknown';
+      const previous = cloudRegistrationAttempts.get(ip);
+      const state = previous && Date.now() < previous.resetAt ? previous : { count: 0, resetAt: 0 };
+      if (Date.now() < state.resetAt && state.count >= 5) {
+        return json(res, 429, { error: 'too_many_attempts' });
+      }
+      cloudRegistrationAttempts.set(ip, { count: state.count + 1,
+        resetAt: Date.now() + 60 * 60_000 });
+      const body = await readJson(req, 4096);
+      if (String(body.company || '').trim()) return json(res, 201, { ok: true });
+      const email = String(body.email || '').trim().toLowerCase();
+      const displayName = String(body.displayName || '').trim();
+      const password = String(body.password || '');
+      const emailValid = email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+      if (!emailValid) return json(res, 400, { error: 'invalid_email' });
+      if (!displayName || displayName.length > 40) return json(res, 400, { error: 'invalid_display_name' });
+      if (password.length < 12 || password.length > 128) return json(res, 400, { error: 'invalid_password_length' });
+      if (body.guardianConfirmed !== true || body.termsAccepted !== true) {
+        return json(res, 400, { error: 'consent_required' });
+      }
+      const timestamp = now();
+      try {
+        db.prepare(`INSERT INTO cloud_accounts
+          (email,display_name,password_hash,status,created_at,updated_at)
+          VALUES (?,?,?,?,?,?)`).run(email, displayName, hashPassword(password),
+            'active', timestamp, timestamp);
+      } catch (error) {
+        if (String(error.message).includes('UNIQUE')) return json(res, 409, { error: 'account_exists' });
+        throw error;
+      }
+      return json(res, 201, { ok: true });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/cloud/v1/login') {
+      const ip = req.socket.remoteAddress || 'unknown';
+      const previous = cloudLoginAttempts.get(ip);
+      const state = previous && Date.now() < previous.resetAt ? previous : { count: 0, resetAt: 0 };
+      if (Date.now() < state.resetAt && state.count >= 8) return json(res, 429, { error: 'too_many_attempts' });
+      const body = await readJson(req, 4096);
+      const email = String(body.email || '').trim().toLowerCase();
+      const account = db.prepare("SELECT * FROM cloud_accounts WHERE email=? AND status='active'").get(email);
+      if (!account || !verifyPassword(String(body.password || ''), account.password_hash)) {
+        cloudLoginAttempts.set(ip, { count: state.count + 1,
+          resetAt: Date.now() + 15 * 60_000 });
+        return json(res, 401, { error: 'invalid_credentials' });
+      }
+      cloudLoginAttempts.delete(ip);
+      const token = newToken();
+      const csrf = newToken(24);
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString();
+      db.prepare('DELETE FROM cloud_sessions WHERE account_id=? OR expires_at<=?').run(account.id, now());
+      db.prepare(`INSERT INTO cloud_sessions(token_hash,account_id,csrf_token,expires_at,created_at)
+        VALUES (?,?,?,?,?)`).run(hashToken(token), account.id, csrf, expiresAt, now());
+      const secure = config.cookieSecure ? '; Secure' : '';
+      return json(res, 200, { account: { id: account.id, email: account.email,
+        displayName: account.display_name, emailVerified: Boolean(account.email_verified_at) }, csrfToken: csrf }, {
+        'set-cookie': `bt_cloud_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`,
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/cloud/v1/me') {
+      const session = cloudSession(req);
+      if (!session) return json(res, 401, { error: 'authentication_required' });
+      return json(res, 200, { account: publicCloudAccount(session), csrfToken: session.csrf_token });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/cloud/v1/logout') {
+      const session = cloudSession(req);
+      if (!session) return json(res, 401, { error: 'authentication_required' });
+      if (req.headers['x-csrf-token'] !== session.csrf_token) return json(res, 403, { error: 'invalid_csrf_token' });
+      db.prepare('DELETE FROM cloud_sessions WHERE token_hash=?').run(session.token_hash);
+      const secure = config.cookieSecure ? '; Secure' : '';
+      return json(res, 200, { ok: true }, {
+        'set-cookie': `bt_cloud_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`,
+      });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/device/v1/identity') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      return json(res, 200, { version: 1, deviceId: device.device_id });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/device/v1/mood') {
       const device = requireDevice(req, res);
       if (!device) return;
       const mood = readMoodState(device.id);
+      const band = readCharacterState(db, device.id).band;
       return json(res, 200, { version: 1, mood: {
         label: mood.label, intensity: mood.intensity,
         valence: mood.valence, arousal: mood.arousal,
         dominance: mood.dominance,
-      }, thought: mood.thought, updatedAt: mood.updatedAt });
+      }, thought: mood.thought, band, updatedAt: mood.updatedAt });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/device/v1/dream-deck') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const deck = await dreamDeckFor(device);
+      return json(res, 200, { version: 2, localDay: deck.day,
+        source: deck.source, generatedAt: deck.generatedAt,
+        entries: deck.entries.map(({ key, displayText }) => [key, displayText]) });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/device/v2/state') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const serverNowUtc = now();
+      const state = readCharacterState(db, device.id, serverNowUtc);
+      const schedule = nightLockWindows(serverNowUtc, state.policy.timeZone);
+      return json(res, 200, { version: 2, serverNowUtc,
+        clock: { ...schedule, serverNowEpochMs: Date.parse(serverNowUtc),
+          validUntilEpochMs: Date.parse(schedule.validUntilUtc),
+          windowsEpochMs: schedule.windowsUtc.map(([start, end]) =>
+            [Date.parse(start), Date.parse(end)]) },
+        state,
+        personality: readPersonality(db, device.id) });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/device/v2/state/ack') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const body = await readJson(req, 1024);
+      try {
+        return json(res, 200, { version: 2,
+          ack: recordDeviceStateAck(db, device.id, body) });
+      } catch (error) {
+        return json(res, 400, { error: error.message });
+      }
+    }
+
+    if (req.method === 'POST' &&
+        url.pathname === '/api/device/v2/personality/bootstrap') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const body = await readJson(req, 1024);
+      try {
+        return json(res, 200, { personality:
+          bootstrapPersonalityFromDevice(db, device.id, body) });
+      } catch (error) { return json(res, 400, { error: error.message }); }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/device/v2/state/events') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const body = await readJson(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return json(res, 400, { error: 'invalid_character_event' });
+      }
+      try {
+        const result = recordCharacterEvent(db, device.id,
+          { eventId: body.eventId, kind: body.kind, source: 'device' });
+        return json(res, 200, { version: 2, ...result });
+      } catch (error) {
+        const status = error.message === 'character_event_rate_limited' ? 429 :
+          error.message === 'character_night_locked' ? 423 : 400;
+        return json(res, status, { error: error.message });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/parent/v1/claim') {
+      const ip = req.socket.remoteAddress || 'unknown';
+      const previous = parentClaimAttempts.get(ip);
+      const current = previous && Date.now() < previous.resetAt ? previous :
+        { count: 0, resetAt: Date.now() + 15 * 60_000 };
+      if (current.count >= 10) return json(res, 429, { error: 'too_many_attempts' });
+      const body = await readJson(req, 1024);
+      const result = claimParentAccess(db, body?.code);
+      if (!result) {
+        parentClaimAttempts.set(ip, { count: current.count + 1,
+          resetAt: current.resetAt });
+        return json(res, 401, { error: 'pairing_code_invalid_or_expired' });
+      }
+      parentClaimAttempts.delete(ip);
+      audit('parent.claimed', result.deviceId, { ip });
+      return json(res, 200, result);
+    }
+
+    if (url.pathname.startsWith('/api/parent/v1/')) {
+      const parent = requireParent(req, res);
+      if (!parent) return;
+      if (req.method === 'GET' && url.pathname === '/api/parent/v1/me') {
+        return json(res, 200, { deviceId: parent.public_id });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/parent/v1/logout') {
+        revokeParentAccess(db, req.headers.authorization);
+        return json(res, 200, { ok: true });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/parent/v1/sketch-guesses') {
+        const body = await readJson(req, 160 * 1024);
+        const id = body?.requestId;
+        const round = Number(body?.round);
+        const encoded = body?.jpegBase64;
+        if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id) ||
+            !Number.isInteger(round) || round < 1 || round > 3 ||
+            typeof encoded !== 'string' || encoded.length < 172 ||
+            encoded.length > 132_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+          return json(res, 400, { error: 'sketch_guess_invalid' });
+        }
+        pruneTextTurns();
+        const repeated = textTurns.get(id);
+        if (repeated) {
+          return repeated.deviceId === parent.device_id && repeated.game === 'sketch_guess'
+            ? json(res, 200, { id, status: repeated.status, guess: repeated.guess,
+              reply: repeated.reply })
+            : json(res, 409, { error: 'text_turn_conflict' });
+        }
+        if (readCharacterState(db, parent.device_id).deepNightGateRequested) {
+          return json(res, 423, { error: 'character_night_locked' });
+        }
+        if (pendingTextTurnCount(parent.device_id) >= textTurnMaxPendingPerDevice) {
+          return json(res, 503, { error: 'text_turn_capacity' });
+        }
+        const nowMs = Date.now();
+        const previousLimit = sketchGuessLimits.get(parent.device_id);
+        const limit = previousLimit && nowMs < previousLimit.resetAt
+          ? previousLimit : { count: 0, resetAt: nowMs + 2 * 60_000 };
+        if (limit.count >= 6) {
+          return json(res, 429, { error: 'sketch_guess_rate_limited' });
+        }
+        limit.count += 1;
+        sketchGuessLimits.set(parent.device_id, limit);
+        if (textTurns.size >= 100) return json(res, 503, { error: 'text_turn_capacity' });
+        try {
+          const normalized = await normalizeSketchJpeg(Buffer.from(encoded, 'base64'));
+          const visionProvider = activeProvider('asr');
+          if (visionProvider?.provider !== 'qwen') {
+            return json(res, 503, { error: 'vision_credentials_unavailable' });
+          }
+          const upstream = await requestChatCompletion({ selected: {
+            provider: 'qwen', model: 'qwen3-vl-plus', base_url: null,
+            options_json: JSON.stringify({ thinkingMode: 'off' }),
+          }, credentials: providerCredentials(visionProvider), request: {
+            messages: [{ role: 'system', content: SKETCH_GUESS_PROMPT },
+              { role: 'user', content: [
+                { type: 'text', text: `这是第 ${round} 次猜测，只猜画面主体。` },
+                { type: 'image_url', image_url: {
+                  url: `data:image/jpeg;base64,${normalized.toString('base64')}`,
+                } },
+              ] }], stream: false, temperature: 0, max_tokens: 80,
+          }, timeoutMs: 12_000 });
+          if (!upstream.ok) return json(res, 502, { error: 'sketch_guess_upstream_rejected' });
+          const visionBody = await upstream.json();
+          const guess = parseSketchGuess(visionBody?.choices?.[0]?.message?.content);
+          if (!guess) return json(res, 502, { error: 'sketch_guess_response_invalid' });
+          const submittedAt = Date.now();
+          const reply = guess === '神秘图案' ? '嗯……我还没看懂，再添几笔吧！' :
+            `我猜这是${guess}！`;
+          textTurns.set(id, { id, deviceId: parent.device_id,
+            text: '[猜画游戏]孩子提交了一份草稿。', presetReply: reply,
+            skipMemory: true, game: 'sketch_guess', guess, reply: null,
+            status: 'queued', claimDeadlineAt: null,
+            expiresAt: submittedAt + 5 * 60_000, submittedAt });
+          dispatchNextTextTurn(parent.device_id);
+          audit('parent.sketch_guessed', parent.public_id,
+            { round, guess, bytes: normalized.length });
+          return json(res, 202, { id, status: 'queued', guess, reply });
+        } catch (error) {
+          const code = error.code || error.message || 'sketch_guess_failed';
+          const status = code === 'sketch_jpeg_invalid' ||
+            code === 'sketch_ink_invalid' ? 400 : error.status || 502;
+          return json(res, status, { error: code });
+        }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/parent/v1/text-turns') {
+        const body = await readJson(req, 2048);
+        const text = typeof body?.text === 'string' ? body.text.trim() : '';
+        const id = body?.requestId;
+        if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id) ||
+            !text || text.length > 280 || /[\u0000-\u001f\u007f]/u.test(text)) {
+          return json(res, 400, { error: 'text_turn_invalid' });
+        }
+        pruneTextTurns();
+        const repeated = textTurns.get(id);
+        if (repeated) {
+          return repeated.deviceId === parent.device_id
+            ? json(res, 200, { id, status: repeated.status, reply: repeated.reply })
+            : json(res, 409, { error: 'text_turn_conflict' });
+        }
+        if (readCharacterState(db, parent.device_id).deepNightGateRequested) {
+          return json(res, 423, { error: 'character_night_locked' });
+        }
+        if (pendingTextTurnCount(parent.device_id) >= textTurnMaxPendingPerDevice) {
+          return json(res, 503, { error: 'text_turn_capacity' });
+        }
+        if (textTurns.size >= 100) return json(res, 503, { error: 'text_turn_capacity' });
+        // A missing poll does not prove the robot is offline: camera/remote
+        // mode intentionally pauses text polling. Give it one bounded chance
+        // to leave that mode; expiry still fails without executing the turn.
+        const submittedAt = Date.now();
+        textTurns.set(id, { id, deviceId: parent.device_id, text,
+          reply: null, status: 'queued', claimDeadlineAt: null,
+          expiresAt: submittedAt + 5 * 60_000, submittedAt });
+        dispatchNextTextTurn(parent.device_id);
+        return json(res, 202, { id, status: 'queued' });
+      }
+      if (req.method === 'GET' && /^\/api\/parent\/v1\/text-turns\/[0-9a-f-]{36}$/i.test(url.pathname)) {
+        const id = url.pathname.split('/').at(-1);
+        pruneTextTurns();
+        const turn = textTurns.get(id);
+        if (!turn || turn.deviceId !== parent.device_id) {
+          return json(res, 404, { error: 'text_turn_not_found' });
+        }
+        return json(res, 200, { id, status: turn.status, reply: turn.reply,
+          error: turn.error || null });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/parent/v1/state') {
+        const state = readCharacterState(db, parent.device_id);
+        const personality = readPersonality(db, parent.device_id);
+        const ack = readDeviceStateAck(db, parent.device_id);
+        return json(res, 200, { deviceId: parent.public_id,
+          state: { ...state, enforcement:
+            ack.fresh && ack.policyRevision === state.policyRevision ?
+              'device_confirmed' : 'pending_device' },
+          personality, ack });
+      }
+      if (req.method === 'PUT' && url.pathname === '/api/parent/v1/policy') {
+        const body = await readJson(req, 4096);
+        try {
+          const state = setCharacterPolicy(db, parent.device_id, body || {});
+          audit('parent.policy.updated', parent.public_id, { revision: state.revision });
+          return json(res, 200, { state });
+        } catch (error) {
+          return json(res, error.message === 'character_policy_conflict' ? 409 : 400,
+            { error: error.message });
+        }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/parent/v1/events') {
+        const body = await readJson(req, 4096);
+        try {
+          const result = recordCharacterEvent(db, parent.device_id,
+            { eventId: body?.eventId, kind: body?.kind, source: 'parent' });
+          return json(res, 200, result);
+        } catch (error) {
+          return json(res, error.message === 'character_event_rate_limited' ? 429 :
+            error.message === 'character_night_locked' ? 423 : 400,
+            { error: error.message });
+        }
+      }
+      if (url.pathname === '/api/parent/v1/personality') {
+        if (req.method === 'GET') return json(res, 200, {
+          personality: readPersonality(db, parent.device_id),
+          ack: readDeviceStateAck(db, parent.device_id) });
+        if (req.method === 'PUT') {
+          const body = await readJson(req, 1024);
+          try {
+            const personality = setPersonality(db, parent.device_id, body);
+            audit('parent.personality.updated', parent.public_id,
+              { revision: personality.revision });
+            return json(res, 200, { personality });
+          } catch (error) {
+            return json(res, error.message === 'personality_conflict' ? 409 : 400,
+              { error: error.message });
+          }
+        }
+      }
+      if (url.pathname === '/api/parent/v1/memories') {
+        if (req.method === 'GET') return json(res, 200, { memories:
+          listApprovedMemories(db, secrets, parent.device_id) });
+        if (req.method === 'POST') {
+          const body = await readJson(req, 4096);
+          try {
+            const memory = addApprovedMemory(db, secrets, parent.device_id, body || {});
+            audit('parent.memory.approved', parent.public_id,
+              { id: memory.id, kind: memory.kind, subject: memory.subject });
+            return json(res, 201, { memory });
+          } catch (error) { return json(res, 400, { error: error.message }); }
+        }
+        if (req.method === 'DELETE') {
+          const id = url.searchParams.get('id');
+          if (id === null) {
+            const removed = clearApprovedMemories(db, parent.device_id);
+            audit('parent.memory.cleared', parent.public_id, { removed });
+            return json(res, 200, { removed });
+          }
+          if (!/^[0-9a-f-]{36}$/i.test(id)) return json(res, 400, { error: 'invalid_memory_id' });
+          const removed = revokeApprovedMemory(db, parent.device_id, id);
+          if (removed) audit('parent.memory.deleted', parent.public_id, { id });
+          return json(res, 200, { removed });
+        }
+        if (req.method === 'PUT') {
+          const id = url.searchParams.get('id') || '';
+          if (!/^[0-9a-f-]{36}$/i.test(id)) return json(res, 400, { error: 'invalid_memory_id' });
+          const body = await readJson(req, 4096);
+          try {
+            const memory = updateApprovedMemory(db, secrets, parent.device_id,
+              id, body || {});
+            audit('parent.memory.updated', parent.public_id,
+              { id, revision: memory.revision });
+            return json(res, 200, { memory });
+          } catch (error) {
+            return json(res, error.message === 'memory_conflict' ? 409 : 400,
+              { error: error.message });
+          }
+        }
+      }
+      if (url.pathname === '/api/parent/v1/questions') {
+        if (req.method === 'PUT') {
+          const body = await readJson(req, 4096);
+          try {
+            const policy = setQuestionHistoryPolicy(db, parent.device_id, body || {});
+            audit('parent.questions.policy', parent.public_id,
+              { enabled: policy.enabled, retentionDays: policy.retentionDays });
+            return json(res, 200, { policy });
+          } catch (error) { return json(res, 400, { error: error.message }); }
+        }
+        if (req.method === 'DELETE') {
+          const rawId = url.searchParams.get('id');
+          const id = rawId === null ? null : Number(rawId);
+          try {
+            const removed = deleteQuestion(db, parent.device_id, id);
+            audit('parent.questions.deleted', parent.public_id, { removed });
+            return json(res, 200, { removed });
+          } catch (error) { return json(res, 400, { error: error.message }); }
+        }
+        if (req.method === 'GET') {
+          const rawBefore = url.searchParams.get('beforeId');
+          const beforeId = rawBefore === null ? null : Number(rawBefore);
+          const limit = Number(url.searchParams.get('limit') || 20);
+          try {
+            return json(res, 200, {
+              policy: readQuestionHistoryPolicy(db, parent.device_id),
+              questions: listQuestions(db, secrets, parent.device_id,
+                { beforeId, limit }),
+            });
+          } catch (error) { return json(res, 400, { error: error.message }); }
+        }
+      }
+      return false;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/auth/login') {
@@ -379,6 +1107,127 @@ export function createApp(config) {
         FROM device_mood_events WHERE device_id=? ORDER BY id DESC LIMIT 30`)
         .all(device.id);
       return json(res, 200, { deviceId: device.device_id, mood, events });
+    }
+
+    if (['GET', 'PUT', 'POST'].includes(req.method) &&
+        url.pathname === '/api/admin/character-state') {
+      const session = requireAdmin(req, res, req.method !== 'GET');
+      if (!session) return;
+      const body = req.method === 'GET' ? null : await readJson(req);
+      if (req.method !== 'GET' && (!body || typeof body !== 'object' || Array.isArray(body))) {
+        return json(res, 400, { error: 'invalid_character_request' });
+      }
+      const deviceId = req.method === 'GET' ? url.searchParams.get('deviceId') : body.deviceId;
+      const device = db.prepare('SELECT id,device_id FROM devices WHERE device_id=?')
+        .get(deviceId || '');
+      if (!device) return json(res, 404, { error: 'device_not_found' });
+      try {
+        if (req.method === 'GET') return json(res, 200, { version: 2,
+          deviceId: device.device_id, state: readCharacterState(db, device.id) });
+        if (req.method === 'PUT') {
+          const state = setCharacterPolicy(db, device.id, body);
+          audit('character.policy.updated', session.username, { deviceId: device.device_id,
+            revision: state.revision });
+          return json(res, 200, { version: 2, deviceId: device.device_id, state });
+        }
+        const result = recordCharacterEvent(db, device.id,
+          { eventId: body.eventId, kind: body.kind, source: 'parent' });
+        if (!result.duplicate) audit('character.event', session.username,
+          { deviceId: device.device_id, kind: body.kind, revision: result.state.revision });
+        return json(res, 200, { version: 2, deviceId: device.device_id, ...result });
+      } catch (error) {
+        const status = error.message === 'character_policy_conflict' ? 409 :
+          error.message === 'character_event_rate_limited' ? 429 :
+          error.message === 'character_night_locked' ? 423 : 400;
+        return json(res, status, { error: error.message });
+      }
+    }
+
+    if (['POST', 'DELETE'].includes(req.method) &&
+        url.pathname === '/api/admin/parent-claims') {
+      const session = requireAdmin(req, res, true);
+      if (!session) return;
+      const body = req.method === 'POST' ? await readJson(req, 4096) : null;
+      const deviceId = body?.deviceId || url.searchParams.get('deviceId') || '';
+      const device = db.prepare('SELECT id,device_id FROM devices WHERE device_id=?')
+        .get(deviceId);
+      if (!device) return json(res, 404, { error: 'device_not_found' });
+      if (req.method === 'DELETE') {
+        const revoked = revokeDeviceParents(db, device.id);
+        audit('parent.sessions.revoked', session.username, { deviceId, revoked });
+        return json(res, 200, { revoked });
+      }
+      const claim = createParentClaim(db, device.id);
+      audit('parent.claim.created', session.username, { deviceId });
+      return json(res, 201, { deviceId, ...claim });
+    }
+
+    if (['GET', 'POST', 'DELETE'].includes(req.method) &&
+        url.pathname === '/api/admin/approved-memories') {
+      const session = requireAdmin(req, res, req.method !== 'GET');
+      if (!session) return;
+      const body = req.method === 'POST' ? await readJson(req) : null;
+      if (req.method === 'POST' && (!body || typeof body !== 'object' || Array.isArray(body))) {
+        return json(res, 400, { error: 'invalid_memory' });
+      }
+      const deviceId = body?.deviceId || url.searchParams.get('deviceId') || '';
+      const device = db.prepare('SELECT id,device_id FROM devices WHERE device_id=?')
+        .get(deviceId);
+      if (!device) return json(res, 404, { error: 'device_not_found' });
+      if (req.method === 'GET') return json(res, 200, { deviceId,
+        memories: listApprovedMemories(db, secrets, device.id) });
+      if (req.method === 'DELETE') {
+        const id = url.searchParams.get('id') || '';
+        if (!/^[0-9a-f-]{36}$/i.test(id)) return json(res, 400, { error: 'invalid_memory_id' });
+        const removed = revokeApprovedMemory(db, device.id, id);
+        if (removed) audit('memory.revoked', session.username, { deviceId, id });
+        return json(res, 200, { removed });
+      }
+      try {
+        const memory = addApprovedMemory(db, secrets, device.id, body);
+        audit('memory.approved', session.username,
+          { deviceId, id: memory.id, kind: memory.kind, subject: memory.subject });
+        return json(res, 201, { deviceId, memory });
+      } catch (error) {
+        return json(res, 400, { error: error.message });
+      }
+    }
+
+    if (['GET', 'PUT', 'DELETE'].includes(req.method) &&
+        url.pathname === '/api/admin/question-history') {
+      const session = requireAdmin(req, res, req.method !== 'GET');
+      if (!session) return;
+      const body = req.method === 'PUT' ? await readJson(req) : null;
+      if (req.method === 'PUT' && (!body || typeof body !== 'object' || Array.isArray(body))) {
+        return json(res, 400, { error: 'invalid_question_history_policy' });
+      }
+      const deviceId = body?.deviceId || url.searchParams.get('deviceId') || '';
+      const device = db.prepare('SELECT id,device_id FROM devices WHERE device_id=?')
+        .get(deviceId);
+      if (!device) return json(res, 404, { error: 'device_not_found' });
+      try {
+        if (req.method === 'PUT') {
+          const policy = setQuestionHistoryPolicy(db, device.id, body);
+          audit('question_history.policy', session.username,
+            { deviceId, enabled: policy.enabled, retentionDays: policy.retentionDays });
+          return json(res, 200, { deviceId, policy });
+        }
+        if (req.method === 'DELETE') {
+          const rawId = url.searchParams.get('id');
+          const id = rawId === null ? null : Number(rawId);
+          const removed = deleteQuestion(db, device.id, id);
+          audit('question_history.deleted', session.username, { deviceId, removed });
+          return json(res, 200, { removed });
+        }
+        const rawBefore = url.searchParams.get('beforeId');
+        const beforeId = rawBefore === null ? null : Number(rawBefore);
+        const limit = Number(url.searchParams.get('limit') || 20);
+        return json(res, 200, { deviceId,
+          policy: readQuestionHistoryPolicy(db, device.id),
+          questions: listQuestions(db, secrets, device.id, { beforeId, limit }) });
+      } catch (error) {
+        return json(res, 400, { error: error.message });
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/api/admin/ai-explorations') {
@@ -589,20 +1438,7 @@ export function createApp(config) {
       if (!device) return;
       const row = db.prepare('SELECT * FROM firmware WHERE id=? AND published=1').get(Number(downloadMatch[1]));
       if (!row || row.board !== device.board) return json(res, 404, { error: 'firmware_not_found' });
-      const stat = statSync(row.file_path);
-      const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
-      const start = range ? Number(range[1]) : 0;
-      const end = range && range[2] ? Math.min(Number(range[2]), stat.size - 1) : stat.size - 1;
-      if (start < 0 || start > end || start >= stat.size) {
-        res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
-        return res.end();
-      }
-      const partial = Boolean(range);
-      const headers = { 'content-type': 'application/octet-stream', 'content-length': end - start + 1, 'accept-ranges': 'bytes',
-        'content-disposition': `attachment; filename="${row.file_name}"`, 'x-firmware-sha256': row.sha256, 'cache-control': 'private, no-store' };
-      if (partial) headers['content-range'] = `bytes ${start}-${end}/${stat.size}`;
-      res.writeHead(partial ? 206 : 200, headers);
-      return createReadStream(row.file_path, { start, end }).pipe(res);
+      return serveFirmware(req, res, row, 'private, no-store');
     }
 
     if (req.method === 'POST' && url.pathname === '/api/device/v1/ota/report') {
@@ -742,7 +1578,8 @@ export function createApp(config) {
         const previous = readConversationMemory(db, secrets, device.id);
         const currentMood = readMoodState(device.id);
         const messages = conversationMessages(state.userText, previous,
-          state.personality || {}, currentMood);
+          state.personality || {}, currentMood,
+          relevantApprovedMemories(db, secrets, device.id, state.userText));
         messages.splice(1, 0, { role: 'system', content: visionAnswerPrompt });
         messages[messages.length - 1].content = [
           { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${jpeg.toString('base64')}` } },
@@ -760,9 +1597,13 @@ export function createApp(config) {
         if (!reply) {
           return json(res, 502, { error: 'vision_reply_invalid' });
         }
-        const nextMood = advanceMood(currentMood,
-          reply.speechSegments.at(-1).emotion,
-          reply.speechSegments.at(-1).intensity, reply.thought);
+        const textTurn = state.textTurnId ? textTurns.get(state.textTurnId) : null;
+        if (textTurn && textTurn.deviceId === device.id) {
+          textTurn.reply = reply.text;
+          textTurn.status = 'reply_ready';
+          textTurn.replyReadyAt = Date.now();
+        }
+        const nextMood = moodAfterReply(device.id, reply.thought);
         /* A vision model can describe a scene, but cannot grant movement or
          * recursively request another photo. Those fields are ignored. */
         const chunks = [];
@@ -781,7 +1622,7 @@ export function createApp(config) {
           }
         }
         if (total < 2 || total % 2 !== 0) return json(res, 502, { error: 'vision_tts_invalid' });
-        rememberConversation(device.id, state.userText, reply.text);
+        rememberConversation(device.id, state.userText, reply.text, traceId, true);
         rememberMood(device.id, traceId, 'vision',
           reply.speechSegments.at(-1).emotion,
           reply.speechSegments.at(-1).intensity, nextMood);
@@ -797,6 +1638,11 @@ export function createApp(config) {
         if (res.headersSent) return res.destroy(error);
         return json(res, error.status || 502, { error: error.code || 'vision_failed' });
       } finally {
+        const textTurn = state.textTurnId ? textTurns.get(state.textTurnId) : null;
+        if (textTurn && res.statusCode >= 400) {
+          textTurn.status = 'failed';
+          textTurn.error = 'vision_failed';
+        }
         visionSessions.delete(traceId);
       }
     }
@@ -846,19 +1692,83 @@ export function createApp(config) {
         usedSteps: state.steps, usedMs: state.totalMs });
     }
 
-    if (req.method === 'POST' && ['/api/device/v1/conversation', '/api/device/v1/conversation/stream'].includes(url.pathname)) {
-      const streaming = url.pathname.endsWith('/stream');
+    if (req.method === 'GET' && url.pathname === '/api/device/v1/text-turns/next') {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      if (readCharacterState(db, device.id).deepNightGateRequested) {
+        return res.writeHead(204, { 'cache-control': 'no-store' }).end();
+      }
+      pruneTextTurns();
+      const turn = claimQueuedTextTurn(device.id);
+      if (turn) return json(res, 200, { id: turn.id });
+      if (url.searchParams.get('wait') === '0') {
+        return res.writeHead(204, { 'cache-control': 'no-store' }).end();
+      }
+      if (textWaiters.has(device.id)) {
+        return json(res, 409, { error: 'text_turn_waiter_busy' });
+      }
+      const requestedWaitMs = Number(url.searchParams.get('waitMs'));
+      const waitMs = Number.isFinite(requestedWaitMs) && requestedWaitMs > 0
+        ? Math.min(15_000, Math.max(100, Math.trunc(requestedWaitMs)))
+        : 15_000;
+      const timer = setTimeout(() => {
+        textWaiters.delete(device.id);
+        if (!res.destroyed && !res.writableEnded) {
+          res.writeHead(204, { 'cache-control': 'no-store' }).end();
+        }
+      }, waitMs);
+      textWaiters.set(device.id, { res, timer });
+      res.once('close', () => {
+        if (textWaiters.get(device.id)?.res === res) {
+          textWaiters.delete(device.id);
+          clearTimeout(timer);
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && /^\/api\/device\/v1\/text-turns\/[0-9a-f-]{36}\/complete$/i.test(url.pathname)) {
+      const device = requireDevice(req, res);
+      if (!device) return;
+      const id = url.pathname.split('/').at(-2);
+      const turn = textTurns.get(id);
+      if (!turn || turn.deviceId !== device.id) {
+        return json(res, 404, { error: 'text_turn_not_found' });
+      }
+      const body = await readJson(req, 512);
+      if (!['completed', 'failed', 'blocked'].includes(body?.status)) {
+        return json(res, 400, { error: 'text_turn_result_invalid' });
+      }
+      if (!['claimed', 'processing', 'waiting_vision', 'reply_ready'].includes(turn.status)) {
+        return json(res, 409, { error: 'text_turn_not_active' });
+      }
+      turn.status = body.status === 'completed' ? 'completed' : 'failed';
+      turn.error = body.status === 'blocked' ? 'device_policy_blocked' :
+        body.status === 'failed' ? 'device_playback_failed' : null;
+      dispatchNextTextTurn(device.id);
+      return json(res, 200, { id, status: turn.status });
+    }
+
+    if (req.method === 'POST' && ['/api/device/v1/conversation', '/api/device/v1/conversation/stream',
+      '/api/device/v1/conversation/text'].includes(url.pathname)) {
+      const textTurnMode = url.pathname.endsWith('/text');
+      const streaming = url.pathname.endsWith('/stream') || textTurnMode;
       const device = requireDevice(req, res);
       if (!device) return;
       if (conversationBusy.has(device.id)) return json(res, 409, { error: 'conversation_busy' });
+      const textTurn = textTurnMode ? textTurns.get(url.searchParams.get('jobId') || '') : null;
+      if (textTurnMode && (!textTurn || textTurn.deviceId !== device.id ||
+          textTurn.status !== 'claimed' || Date.now() > textTurn.expiresAt)) {
+        return json(res, 409, { error: 'text_turn_not_ready' });
+      }
       const asr = activeProvider('asr');
       const llm = activeProvider('llm');
       const tts = activeProvider('tts');
-      if (!asr || !llm || !tts) return json(res, 503, { error: 'conversation_provider_not_configured' });
-      if (asr.provider !== 'qwen' || tts.provider !== 'volcengine') {
+      if ((!textTurnMode && !asr) || !llm || !tts) return json(res, 503, { error: 'conversation_provider_not_configured' });
+      if ((!textTurnMode && asr.provider !== 'qwen') || tts.provider !== 'volcengine') {
         return json(res, 501, { error: 'conversation_provider_not_implemented' });
       }
-      if (url.searchParams.get('format') !== 'pcm' || url.searchParams.get('sampleRate') !== '16000') {
+      if (!textTurnMode && (url.searchParams.get('format') !== 'pcm' || url.searchParams.get('sampleRate') !== '16000')) {
         return json(res, 400, { error: 'conversation_audio_format_invalid' });
       }
       const touch = url.searchParams.get('touch');
@@ -872,12 +1782,22 @@ export function createApp(config) {
       if (touch !== null && touch !== 'left' && touch !== 'right') {
         return json(res, 400, { error: 'conversation_touch_invalid' });
       }
-      const personality = Object.fromEntries(['curiosity', 'warmth', 'talkativeness']
-        .map((key) => [key, url.searchParams.get(key)]));
+      // Parent-approved cloud revision is authoritative. Legacy query traits
+      // remain on the wire for old heads but can no longer overwrite it.
+      const personality = readPersonality(db, device.id);
       conversationBusy.add(device.id);
       const startedAt = performance.now();
+      if (textTurn) {
+        textTurn.status = 'processing';
+        textTurn.activeAt = Date.now();
+      }
       const metrics = { event: 'conversation.metrics', traceId: randomUUID(), device: device.id,
-        kind: touch === null ? 'speech' : 'touch', diagnostic, streaming, inputBytes: 0 };
+        kind: textTurnMode ? 'text' : touch === null ? 'speech' : 'touch', diagnostic,
+        streaming, inputBytes: textTurn ? Buffer.byteLength(textTurn.text) : 0 };
+      if (textTurn) {
+        metrics.textQueueMs = textTurn.claimedAt - textTurn.submittedAt;
+        metrics.textClaimToRequestMs = Date.now() - textTurn.claimedAt;
+      }
       let logged = false;
       const logMetrics = (event) => {
         if (logged) return;
@@ -924,7 +1844,7 @@ export function createApp(config) {
           metrics.uploadMs = Math.round(performance.now() - (firstAt || startedAt));
         }
         const asrStartedAt = performance.now();
-        const recognized = touch === null
+        const recognized = textTurn ? { text: textTurn.text } : touch === null
           ? await (streaming
             ? recognizeStreamWithQwen({ selected: asr, credentials: providerCredentials(asr),
               audioChunks: streamedAudio(), format: 'pcm', sampleRate: 16000,
@@ -936,7 +1856,7 @@ export function createApp(config) {
             '你是从待机睡觉中被轻轻摸醒的。结合当前长期心情，给出一句自然、简短、可被TTS朗读的即时反应，' +
             '并为这次触摸选择匹配的瞬时表情和新的睡眠气泡想法。不要反问，不要解释这是系统事件，' +
             '不要每次都使用同一句话，也不要输出行走、摄像头或绘画动作。' };
-        metrics.asrMs = Math.round(performance.now() - asrStartedAt);
+        metrics.asrMs = textTurn ? 0 : Math.round(performance.now() - asrStartedAt);
         const userText = typeof recognized.text === 'string' ? recognized.text.trim() : '';
         if (!userText) return json(res, 422, { error: 'conversation_speech_not_recognized' });
         const sleepRequested = touch === null && explicitSleepIntent(userText);
@@ -946,7 +1866,7 @@ export function createApp(config) {
          * controls never wait for a photo. */
         const visualContextTurn = streaming &&
           url.searchParams.get('vision') === 'always' && touch === null &&
-          !diagnostic && !sleepRequested && !explicitDriveIntent(userText) &&
+          !diagnostic && !sleepRequested &&
           !explicitExploreIntent(userText) && !explicitDrawIntent(userText) &&
           explicitLookIntent(userText);
         if (visualContextTurn) {
@@ -955,7 +1875,12 @@ export function createApp(config) {
           }
           if (visionSessions.size < 100) {
             visionSessions.set(metrics.traceId, { deviceId: device.id, userText,
-              personality, busy: false, expiresAt: Date.now() + 120_000 });
+              personality, textTurnId: textTurn?.id || null,
+              busy: false, expiresAt: Date.now() + 120_000 });
+            if (textTurn) {
+              textTurn.status = 'waiting_vision';
+              textTurn.activeAt = Date.now();
+            }
             logCamera(device.id, metrics.traceId, 'requested');
             metrics.actionType = 'look';
             metrics.actionStatus = 'approved';
@@ -972,80 +1897,119 @@ export function createApp(config) {
         const previous = diagnostic ? [] : readConversationMemory(db, secrets, device.id);
         const currentMood = readMoodState(device.id);
         const llmStartedAt = performance.now();
-        const upstream = await requestChatCompletion({ selected: llm, credentials: providerCredentials(llm),
-          request: { messages: conversationMessages(userText, previous, personality,
-            currentMood), stream: false,
-            temperature: 0.7, max_tokens: explicitDrawIntent(userText) ? 1000 : 400 } });
-        if (!upstream.ok) return json(res, 502, { error: 'conversation_llm_rejected' });
-        const llmBody = await upstream.json();
-        let reply = parseConversationReply(llmBody?.choices?.[0]?.message?.content);
+        const motorDecisionStartedAt = performance.now();
+        const presetReply = typeof textTurn?.presetReply === 'string'
+          ? textTurn.presetReply : null;
+        const motorDecisionPromise = !presetReply && touch === null && !sleepRequested
+          ? requestChatCompletion({ selected: llm, credentials: providerCredentials(llm),
+            request: { messages: driveDecisionMessages(userText), stream: false,
+              temperature: 0, max_tokens: 120 }, timeoutMs: 2000 })
+            .then(async (response) => {
+              if (!response.ok) throw new Error('drive_decision_rejected');
+              const body = await response.json();
+              return parseDriveDecision(body?.choices?.[0]?.message?.content);
+            }).catch((error) => {
+              metrics.driveDecisionError = String(error.code || error.message || 'failed').slice(0, 80);
+              return { status: 'rejected', type: 'none', reason: 'drive_decision_unavailable' };
+            }).then((decision) => {
+              metrics.driveDecisionMs = Math.round(performance.now() - motorDecisionStartedAt);
+              return decision;
+            })
+          : Promise.resolve({ status: 'none', type: 'none', reason: '' });
+        let reply;
+        if (presetReply) {
+          reply = parseConversationReply(JSON.stringify({ reply: presetReply,
+            emotion: 'curious', intensity: 78, action: null, camera: null,
+            drawing: null }));
+          metrics.presetReply = true;
+        } else {
+          const upstream = await requestChatCompletion({ selected: llm,
+            credentials: providerCredentials(llm), request: {
+              messages: conversationMessages(userText, previous, personality,
+                currentMood, diagnostic ? [] : relevantApprovedMemories(
+                  db, secrets, device.id, userText)), stream: false,
+              temperature: 0.7,
+              max_tokens: explicitDrawIntent(userText) ? 1000 : 400,
+            } });
+          if (!upstream.ok) return json(res, 502,
+            { error: 'conversation_llm_rejected' });
+          const llmBody = await upstream.json();
+          reply = parseConversationReply(llmBody?.choices?.[0]?.message?.content);
+        }
         if (!reply) return json(res, 502, { error: 'conversation_llm_response_invalid' });
-        const explicitDrawingRequested = touch === null && explicitDrawIntent(userText);
+        const motorProposal = await motorDecisionPromise;
+        metrics.driveDecisionStatus = motorProposal.status;
+        const explicitDrawingRequested = !presetReply && touch === null &&
+          explicitDrawIntent(userText);
         const autonomousDrawingRequested = touch === null && !diagnostic &&
-          !explicitDrawingRequested && !sleepRequested && !explicitDriveIntent(userText) &&
+          !explicitDrawingRequested && !sleepRequested &&
           !explicitExploreIntent(userText) && !reply.cameraRequested &&
-          reply.action.status !== 'shadow' && reply.drawing !== null;
-        const drawingRequested = explicitDrawingRequested || autonomousDrawingRequested;
+          motorProposal.status !== 'shadow' && reply.drawing !== null;
+        /* Preset game replies have already completed their one intended model
+         * decision. Never reinterpret their internal marker text as a second
+         * drawing request. */
+        const drawingRequested = !presetReply &&
+          (explicitDrawingRequested || autonomousDrawingRequested);
         const drawingSubject = autonomousDrawingRequested ? reply.drawing.subject : userText;
         let drawingCandidate = null;
         if (touch === null && !diagnostic && drawingRequested &&
-            !explicitDriveIntent(userText)) {
-          try {
-            const drawingUpstream = await requestChatCompletion({ selected: llm,
-              credentials: providerCredentials(llm), request: {
-                messages: drawingMessages(drawingSubject), stream: false,
-                temperature: 0.35, max_tokens: 3000,
-              } });
-            if (drawingUpstream.ok) {
+            motorProposal.status !== 'shadow') {
+          const messages = drawingMessages(drawingSubject);
+          for (let attempt = 1; attempt <= 2 && !drawingCandidate; attempt += 1) {
+            metrics.drawingAttempts = attempt;
+            try {
+              const drawingUpstream = await requestChatCompletion({ selected: llm,
+                credentials: providerCredentials(llm), request: {
+                  messages, stream: false, temperature: 0.35, max_tokens: 3000,
+                } });
+              if (!drawingUpstream.ok) throw new Error('drawing_llm_rejected');
               const drawingBody = await drawingUpstream.json();
               const svgDrawing = parseDrawingProposal(
                 drawingBody?.choices?.[0]?.message?.content);
-              drawingCandidate = svgDrawing ? await rasterizeDrawing(svgDrawing) : null;
-              metrics.drawingSource = drawingCandidate ? 'curated_svg_raster' : 'invalid';
-              metrics.drawingDecision = autonomousDrawingRequested ? 'model' : 'asr_rule';
-              if (drawingCandidate) metrics.drawingBytes = drawingCandidate.jpeg.length;
+              if (!svgDrawing) throw new Error('drawing_svg_invalid');
+              drawingCandidate = await rasterizeDrawing(svgDrawing);
+              metrics.drawingSource = 'model_svg';
+              metrics.drawingBytes = drawingCandidate.jpeg.length;
+            } catch (error) {
+              const reason = String(error.code || error.message ||
+                'generation_failed').slice(0, 80);
+              if (attempt === 1) metrics.drawingRetryError = reason;
+              else metrics.drawingError = reason;
+              if (attempt === 1) messages.push({ role: 'user', content:
+                '上一版未通过安全或可见性校验。请重新生成完整 JSON 和 SVG；' +
+                '主体轮廓要明显，严格遵守元素、颜色和尺寸约束。' });
             }
-          } catch (error) {
-            metrics.drawingError = String(error.code || error.message || 'generation_failed').slice(0, 80);
           }
+          metrics.drawingDecision = autonomousDrawingRequested ? 'model' : 'asr_rule';
+          if (!drawingCandidate) metrics.drawingSource = 'invalid';
         }
         if (explicitDrawingRequested && !diagnostic && !drawingCandidate) {
           reply = parseConversationReply(JSON.stringify({ reply: '这次没画出来，我们再试一次吧。',
             emotion: 'confused', intensity: 55, action: null, camera: null }));
         }
         const moodTrigger = reply.speechSegments.at(-1);
-        const nextMood = advanceMood(currentMood, moodTrigger.emotion,
-          moodTrigger.intensity, reply.thought);
+        const nextMood = moodAfterReply(device.id, reply.thought);
         metrics.llmMs = Math.round(performance.now() - llmStartedAt);
         const speechSegments = reply.speechSegments;
         metrics.modelFaceCueCount = speechSegments.length;
         metrics.modelFaceCueSource = reply.speechSegmentSource;
-        // The model may choose motion autonomously, but only inside the
-        // deterministic physical envelope enforced by schema validation,
-        // bounded duration/speed, STOP preemption, and mode ownership.
-        const explicitIntent = touch === null ? explicitDriveIntent(userText) : null;
+        // The model proposes ordinary motor actions. Deterministic checks
+        // only veto dangerous contexts, malformed actions, or conflicts;
+        // they never synthesize a drive when the model omitted one.
+        const modelMotionVeto = motorProposal.status === 'shadow' && touch === null
+          ? modelDriveSafetyReason(userText, motorProposal) : null;
         const exploreRequested = touch === null && !diagnostic && explicitExploreIntent(userText);
-        const action = exploreRequested && reply.action.status === 'shadow'
+        const action = exploreRequested && motorProposal.status === 'shadow'
           ? { status: 'rejected', type: 'none', reason: 'exploration_uses_visual_plan' }
-          : touch !== null && reply.action.status === 'shadow'
+          : touch !== null && motorProposal.status === 'shadow'
           ? { status: 'rejected', type: 'none', reason: 'touch_cannot_drive' }
-          : explicitIntent
-            ? { status: 'shadow', type: 'drive', direction: explicitIntent.direction,
-              speedPerMille: reply.action.status === 'shadow' &&
-                reply.action.direction === explicitIntent.direction
-                ? reply.action.speedPerMille : 900,
-              durationMs: explicitIntent.durationMs ??
-                (reply.action.status === 'shadow' &&
-                 reply.action.direction === explicitIntent.direction
-                  ? reply.action.durationMs : 2000),
-              lightMode: reply.action.status === 'shadow' &&
-                reply.action.direction === explicitIntent.direction
-                ? reply.action.lightMode : 'unchanged', reason: '' }
-            : reply.action.status === 'shadow' &&
-                (sleepRequested || drawingRequested ||
-                 reply.cameraRequested)
-              ? { status: 'rejected', type: 'none', reason: 'mode_cannot_drive' }
-              : reply.action;
+          : motorProposal.status === 'shadow' && modelMotionVeto
+            ? { status: 'rejected', type: 'none', reason: modelMotionVeto }
+          : motorProposal.status === 'shadow' &&
+            (sleepRequested || drawingRequested || reply.cameraRequested)
+              ? { status: 'rejected', type: 'none', reason:
+                  'mode_cannot_drive' }
+              : motorProposal;
         let dispatchMode = action.status === 'shadow' && !diagnostic ? 'execute' : 'shadow';
         metrics.actionStatus = action.status;
         metrics.actionType = action.type;
@@ -1092,7 +2056,7 @@ export function createApp(config) {
           }
         }
         const lookRequested = touch === null && !diagnostic && !sleepRequested &&
-          !exploreRequested && !explicitIntent && !drawingRequested &&
+          !exploreRequested && action.status !== 'shadow' && !drawingRequested &&
           (reply.cameraRequested || explicitLookIntent(userText));
         if (lookRequested && !metrics.actionLogError) {
           for (const [key, value] of visionSessions) {
@@ -1100,8 +2064,13 @@ export function createApp(config) {
           }
           if (visionSessions.size < 100) {
             visionSessions.set(metrics.traceId, { deviceId: device.id, userText,
-              personality,
+              personality, textTurnId: textTurn?.id || null,
               busy: false, expiresAt: Date.now() + 120_000 });
+            if (textTurn) {
+              textTurn.reply = null;
+              textTurn.status = 'waiting_vision';
+              textTurn.activeAt = Date.now();
+            }
             logCamera(device.id, metrics.traceId, 'requested');
             metrics.visualDecision = reply.cameraRequested ? 'model' : 'asr_rule';
             metrics.actionType = 'look';
@@ -1116,7 +2085,7 @@ export function createApp(config) {
         }
         let drawAuthorized = false;
         if (!lookRequested && touch === null && !diagnostic && !sleepRequested &&
-            !exploreRequested && !explicitIntent && drawingRequested &&
+            !exploreRequested && action.status !== 'shadow' && drawingRequested &&
             drawingCandidate && !metrics.actionLogError) {
           for (const [key, value] of drawingSessions) {
             if (Date.now() > value.expiresAt) drawingSessions.delete(key);
@@ -1128,6 +2097,11 @@ export function createApp(config) {
             metrics.actionType = 'draw';
             metrics.actionStatus = 'approved';
           }
+        }
+        if (textTurn) {
+          textTurn.reply = reply.text;
+          textTurn.status = 'reply_ready';
+          textTurn.replyReadyAt = Date.now();
         }
         const commonAudioHeaders = {
           'content-type': 'audio/pcm', 'cache-control': 'no-store',
@@ -1220,8 +2194,9 @@ export function createApp(config) {
           metrics.outputBytes = audioBytes;
           metrics.pcmDurationMs = Math.round(audioBytes / 32);
           metrics.faceCueCount = speechSegments.length;
-          if (!diagnostic) {
-            rememberConversation(device.id, userText, reply.text);
+          if (!diagnostic && !textTurn?.skipMemory) {
+            rememberConversation(device.id, userText, reply.text, metrics.traceId,
+              touch === null);
             rememberMood(device.id, metrics.traceId,
               touch === null ? 'speech' : 'touch', moodTrigger.emotion,
               moodTrigger.intensity, nextMood);
@@ -1303,8 +2278,9 @@ export function createApp(config) {
         metrics.faceCueCount = faceCues.length;
         metrics.preSendMs = Math.round(performance.now() - startedAt);
         const answerAudio = Buffer.concat(audioChunks, audioBytes);
-        if (!diagnostic) {
-          rememberConversation(device.id, userText, reply.text);
+        if (!diagnostic && !textTurn?.skipMemory) {
+          rememberConversation(device.id, userText, reply.text, metrics.traceId,
+            touch === null);
           rememberMood(device.id, metrics.traceId,
             touch === null ? 'speech' : 'touch', moodTrigger.emotion,
             moodTrigger.intensity, nextMood);
@@ -1319,9 +2295,17 @@ export function createApp(config) {
         return res.end(answerAudio);
       } catch (error) {
         metrics.error = error.code || error.message || 'conversation_failed';
+        if (textTurn) {
+          textTurn.status = 'failed';
+          textTurn.error = String(metrics.error).slice(0, 80);
+        }
         if (res.headersSent) return res.destroy(error);
         return json(res, error.status || 502, { error: error.code || error.message || 'conversation_failed' });
       } finally {
+        if (textTurn && res.statusCode >= 400 && textTurn.status !== 'failed') {
+          textTurn.status = 'failed';
+          textTurn.error = 'conversation_failed';
+        }
         conversationBusy.delete(device.id);
       }
     }
@@ -1399,7 +2383,9 @@ export function createApp(config) {
   }
 
   function serveStatic(req, res, url) {
-    const route = url.pathname === '/' || url.pathname === '/account' || url.pathname === '/account/' ? '/index.html' : url.pathname;
+    const route = url.pathname === '/' ? '/site.html' :
+      ['/console', '/console/', '/register', '/register/'].includes(url.pathname) ? '/cloud.html' :
+      ['/admin', '/admin/', '/account', '/account/'].includes(url.pathname) ? '/index.html' : url.pathname;
     const path = resolve(webRoot, `.${route}`);
     if (!path.startsWith(`${webRoot}/`)) return json(res, 404, { error: 'not_found' });
     try {
@@ -1435,9 +2421,34 @@ export function createApp(config) {
     }
   });
 
-  attachVoiceSocket(server, { authenticate: authenticateDeviceAuthorization,
+  voiceTransport = attachVoiceSocket(server, { authenticate: authenticateDeviceAuthorization,
     speechMaxBytes: config.speechMaxBytes || 4 * 1024 * 1024 });
-  server.on('close', () => db.close());
+  function prunePrivateRecords() {
+    try {
+      const timestamp = now();
+      pruneExpiredMemories(db);
+      pruneExpiredQuestions(db);
+      db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(timestamp);
+      db.prepare('DELETE FROM cloud_sessions WHERE expires_at<=?').run(timestamp);
+      db.prepare(`DELETE FROM parent_sessions
+        WHERE expires_at<=? OR revoked_at IS NOT NULL`).run(timestamp);
+      db.prepare(`DELETE FROM parent_claims
+        WHERE expires_at<=? OR consumed_at IS NOT NULL`).run(timestamp);
+    } catch (error) {
+      console.error(`private record retention cleanup failed: ${error.message}`);
+    }
+  }
+  pruneEphemeralState();
+  prunePrivateRecords();
+  const ephemeralTimer = setInterval(pruneEphemeralState, 60_000);
+  ephemeralTimer.unref();
+  const retentionTimer = setInterval(prunePrivateRecords, 6 * 60 * 60_000);
+  retentionTimer.unref();
+  server.on('close', () => {
+    clearInterval(ephemeralTimer);
+    clearInterval(retentionTimer);
+    db.close();
+  });
   return { server, db };
 }
 

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Baby Tank 是一只可以自己做、自己改，也会慢慢认识你的开源桌面小车。">
+  <meta name="theme-color" content="#f3f1ea">
+  <title>Baby Tank — 开源桌面小车</title>
+  <link rel="stylesheet" href="/site.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到内容</a>
+  <header class="site-header">
+    <a class="wordmark" href="#top" aria-label="Baby Tank 首页"><span class="face-mark"><i></i><i></i></span><b>Baby Tank</b></a>
+    <nav aria-label="主导航"><a href="#about">我们在做什么</a><a href="#origin">硬件来源</a><a href="#firmware">下载固件</a></nav>
+    <a class="header-account" href="/console">我的设备</a>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy reveal">
+        <p class="project-note"><i></i> 开源桌面伙伴</p>
+        <h1>会看你，<br>也会慢慢长大。</h1>
+        <p class="hero-intro">Baby Tank 是我们在 ESP-SparkBot 硬件上重新开发的独立固件项目。从屏幕表情开始，逐步接入语音、移动、App 与云端。</p>
+        <div class="hero-actions">
+          <a class="button button-dark" href="#about">看看它会什么</a>
+          <a class="text-link" href="#firmware">下载稳定版固件 <span>↓</span></a>
+        </div>
+        <div class="hero-meta"><span>独立固件</span><span>开放源码</span><span>持续扩展</span></div>
+      </div>
+
+      <div class="hero-stage" aria-label="Baby Tank 正面插画">
+        <div class="product-object" data-robot>
+          <img src="/assets/baby-tank-flat-front-blank-v1.png" alt="正面看向你的白色 Baby Tank 插画">
+          <div class="product-screen"><canvas data-face aria-label="会自动变化并跟随指针的 Baby Tank 表情"></canvas></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="about" id="about">
+      <div class="section-heading reveal">
+        <p>我们在做什么</p>
+        <h2>先把固件做好，<br>再慢慢长出自己的样子。</h2>
+      </div>
+      <div class="ability-list">
+        <article class="reveal">
+          <span>01</span><h3>重写独立固件</h3><p>从启动、显示和触摸开始，重新实现语音、摄像头、底盘控制与 OTA，不依赖原有小智应用。</p>
+        </article>
+        <article class="reveal">
+          <span>02</span><h3>做完整的软件体验</h3><p>让表情、声音、动作、Android App 与云端属于同一个角色，而不是互不相干的功能演示。</p>
+        </article>
+        <article class="reveal">
+          <span>03</span><h3>继续扩展硬件</h3><p>当前先验证现成硬件；后续再尝试自己的外观、结构件和扩展模块。这部分是计划，不冒充已经完成。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="origin" id="origin">
+      <div class="origin-heading reveal"><p class="label">当前硬件基础</p><h2>原型机基于<br>ESP-SparkBot。</h2></div>
+      <div class="origin-copy reveal">
+        <p>ESP-SparkBot 由 <strong>ESP-Friends</strong> 发布，硬件工程公开在立创开源硬件平台。当前原型头部使用乐鑫 ESP32-S3，履带底盘使用 ESP32-C2。</p>
+        <p>Baby Tank 没有把上游示例或小智应用当作代码基线。我们只参考公开硬件资料、引脚与底盘协议，自行实现固件、Android App、云端编排、角色状态和视觉系统。</p>
+        <div class="origin-links"><a href="https://oshwhub.com/esp-college/esp-sparkbot" target="_blank" rel="noreferrer">硬件工程 ↗</a><a href="https://gitee.com/esp-friends/esp_sparkbot" target="_blank" rel="noreferrer">上游仓库 ↗</a><a href="https://github.com/eggbrid2/baby-tank" target="_blank" rel="noreferrer">Baby Tank 源码 ↗</a></div>
+        <small>ESP-SparkBot、ESP-Friends、乐鑫及上述平台均未对 Baby Tank 作出背书；相关名称仅用于事实性来源说明。</small>
+      </div>
+    </section>
+
+    <section class="firmware" id="firmware">
+      <div class="firmware-intro reveal">
+        <p class="label">官方固件</p>
+        <h2>只发布我们签发的固件。</h2>
+        <p>账号属于每一位用户，设备也绑定在各自的云端空间。官网只提供 Baby Tank 官方稳定版固件。</p>
+      </div>
+      <div class="release-panel reveal" data-release-panel><div class="release-loading">正在读取稳定版…</div></div>
+    </section>
+
+    <section class="account-callout">
+      <div class="account-face" aria-hidden="true"><i></i><i></i><b></b></div>
+      <div class="reveal"><p>已经有一台 Baby Tank？</p><h2>去照看你的那一只。</h2></div>
+      <a class="button button-light reveal" href="/console">进入云端控制台 <span>↗</span></a>
+    </section>
+  </main>
+
+  <footer>
+    <a class="wordmark" href="#top"><span class="face-mark"><i></i><i></i></span><b>Baby Tank</b></a>
+    <p>一只正在长大的开源桌面小车。</p>
+    <div><a href="https://github.com/eggbrid2/baby-tank">GitHub</a><a href="/admin">管理入口</a></div>
+  </footer>
+  <script type="module" src="/site.js"></script>
+</body>
+</html>

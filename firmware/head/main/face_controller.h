@@ -56,16 +56,22 @@ esp_err_t baby_tank_face_submit_ai(const char *emotion,
                                    uint32_t duration_ms);
 /* Long-lived fictional mood shown while awake but idle. */
 esp_err_t baby_tank_face_set_mood(const char *emotion, uint8_t intensity);
+/* A fresh cloud time band changes only the idle schedule, not the safety gate. */
+esp_err_t baby_tank_face_set_time_band(const char *band);
 /* Any real interaction returns the pet to NORMAL and restarts its idle clock. */
 esp_err_t baby_tank_face_note_activity(void);
 /* Explicit sleep/wake override. Ordinary inactivity is handled automatically. */
 esp_err_t baby_tank_face_set_standby(bool standby);
 esp_err_t baby_tank_face_get_presence_state(
     baby_tank_presence_state_t *state);
+/* Local USB-only art check. Never changes the idle timer or persists state;
+ * real interaction and the deep-night policy always cancel the preview. */
+esp_err_t baby_tank_face_debug_preview_scene(baby_tank_scene_t scene);
+void baby_tank_face_debug_stop_preview(void);
 /* Cloud supplies only an allowlisted pictogram key, never drawing commands. */
 esp_err_t baby_tank_face_set_thought(const char *thought);
 esp_err_t baby_tank_face_set_thought_text(const char *utf8_text);
-/* Takes ownership of a validated 240x240 RGB565 SVG raster for 4-8 seconds. */
+/* Takes ownership of a validated 240x240 RGB565 SVG raster for up to 15 seconds. */
 esp_err_t baby_tank_face_submit_drawing(const baby_tank_drawing_t *drawing);
 void baby_tank_face_cancel_drawing(void);
 

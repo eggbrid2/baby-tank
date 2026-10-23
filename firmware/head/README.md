@@ -3,7 +3,7 @@
 This is the independent ESP32-S3 firmware for the Baby Tank head. It is not
 based on an upstream ESP-SparkBot example.
 
-The `0.14.31` build extends the safe bring-up baseline with a procedural animated
+The `0.14.33` build extends the safe bring-up baseline with a procedural animated
 robot-baby face and a half-duplex voice conversation runtime:
 
 - boot through the native USB Serial/JTAG interface;
@@ -177,6 +177,19 @@ ignored by the repository. It is still plaintext NVS data and must be treated
 as a secret; NVS encryption is not enabled in this development build. The
 script never flashes hardware. A token previously pasted into a chat should be
 rotated before real use.
+
+## Saved Wi-Fi networks
+
+The head retains up to four successfully provisioned SSID/password pairs in
+NVS. The most recently provisioned pair is tried first. If association fails,
+the retry timer rotates through the others; a fallback is promoted for the
+next boot only after the Baby Tank cloud health check succeeds. The setup
+hotspot remains available while the station is offline. Networks overwritten
+by older single-network firmware cannot be reconstructed; each must be
+provisioned once again. Passwords are never logged, but this development
+build's NVS is **not encrypted at rest**. A physically accessible flash dump
+can reveal saved Wi-Fi passwords, so do not treat this as secure credential
+storage until NVS encryption and key provisioning are deployed.
 
 ## Pinned toolchain
 

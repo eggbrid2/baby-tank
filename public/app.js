@@ -55,9 +55,28 @@ async function refresh() {
 }
 
 function renderDevices(devices) {
-  const rows = devices.map((d) => `<div class="list-row"><div><strong>${escapeHtml(d.name)}</strong><small>${escapeHtml(d.device_id)} · ${escapeHtml(d.board)}</small></div><div class="row-meta"><strong>${escapeHtml(d.firmware_version || '未上报')}</strong><small>${d.revoked_at ? '已吊销' : ago(d.last_seen_at)}</small></div></div>`).join('');
-  $('#device-list').innerHTML = rows || '<div class="empty">暂无设备</div>';
-  $('#recent-devices').innerHTML = rows || '<div class="empty">暂无设备</div>';
+  const row = (d, claimButton) => `<div class="list-row"><div><strong>${escapeHtml(d.name)}</strong><small>${escapeHtml(d.device_id)} · ${escapeHtml(d.board)}</small></div><div class="row-meta"><strong>${escapeHtml(d.firmware_version || '未上报')}</strong><small>${d.revoked_at ? '已吊销' : ago(d.last_seen_at)}</small>${claimButton && !d.revoked_at ? `<div class="row-actions"><button type="button" data-parent-claim="${escapeHtml(d.device_id)}">生成家长配对码</button><button type="button" data-parent-revoke="${escapeHtml(d.device_id)}">撤销家长访问</button></div>` : ''}</div></div>`;
+  $('#device-list').innerHTML = devices.map((d) => row(d, true)).join('') || '<div class="empty">暂无设备</div>';
+  $('#recent-devices').innerHTML = devices.map((d) => row(d, false)).join('') || '<div class="empty">暂无设备</div>';
+  $$('[data-parent-claim]').forEach((button) => button.addEventListener('click', async () => {
+    const output = $('#parent-claim-result');
+    try {
+      const result = await api('/api/admin/parent-claims', { method: 'POST',
+        body: JSON.stringify({ deviceId: button.dataset.parentClaim }) });
+      output.textContent = `设备 ${result.deviceId} 的家长配对码：${result.code}\n10 分钟内在 Baby Tank App「成长记忆」输入；仅显示一次。`;
+    } catch (error) { output.textContent = `生成失败：${error.message}`; }
+    output.classList.remove('hidden');
+  }));
+  $$('[data-parent-revoke]').forEach((button) => button.addEventListener('click', async () => {
+    if (!confirm(`确定撤销 ${button.dataset.parentRevoke} 的所有家长手机授权？`)) return;
+    const output = $('#parent-claim-result');
+    try {
+      const result = await api(`/api/admin/parent-claims?deviceId=${encodeURIComponent(button.dataset.parentRevoke)}`,
+        { method: 'DELETE' });
+      output.textContent = `已撤销 ${result.revoked} 个家长会话，未使用的配对码也已作废。`;
+    } catch (error) { output.textContent = `撤销失败：${error.message}`; }
+    output.classList.remove('hidden');
+  }));
 }
 
 function renderFirmware(items) {

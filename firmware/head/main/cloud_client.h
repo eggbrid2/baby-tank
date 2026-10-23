@@ -9,7 +9,6 @@
 
 #define BABY_TANK_CLOUD_ORIGIN "https://www.xydocshare.com"
 #define BABY_TANK_CLOUD_BASE_URL BABY_TANK_CLOUD_ORIGIN "/api/device/v1"
-#define BABY_TANK_CLOUD_DEVICE_ID "001"
 
 typedef struct {
     bool available;
@@ -63,6 +62,7 @@ typedef struct {
 
 esp_err_t baby_tank_cloud_set_personality(baby_tank_personality_t personality);
 baby_tank_personality_t baby_tank_cloud_get_personality(void);
+uint32_t baby_tank_cloud_personality_revision(void);
 
 typedef esp_err_t (*baby_tank_cloud_audio_chunk_cb_t)(
     const uint8_t *data,
@@ -86,6 +86,8 @@ typedef esp_err_t (*baby_tank_cloud_pcm_source_cb_t)(
 
 /* Copies the token into RAM. The caller must load it from protected NVS. */
 esp_err_t baby_tank_cloud_init(const char *device_token);
+esp_err_t baby_tank_cloud_fetch_verified_identity(void);
+esp_err_t baby_tank_cloud_copy_verified_device_id(char *output, size_t capacity);
 
 esp_err_t baby_tank_cloud_fetch_config(
     baby_tank_cloud_runtime_config_t *runtime_config);
@@ -94,6 +96,11 @@ esp_err_t baby_tank_cloud_fetch_config(
  * from the cloud mood endpoint while the device is sleeping. */
 esp_err_t baby_tank_cloud_restore_sleep_thought(void);
 esp_err_t baby_tank_cloud_refresh_sleep_thought(void);
+/* Refresh the needs-derived long-term idle expression from the cloud. */
+esp_err_t baby_tank_cloud_refresh_character_mood(void);
+esp_err_t baby_tank_cloud_upload_character_event(const char *event_id,
+                                                 const char *kind,
+                                                 bool *permanent_rejection);
 
 /* Cooperative cancellation for the current HTTP exchange. */
 void baby_tank_cloud_cancel_current(void);
@@ -103,6 +110,10 @@ void baby_tank_cloud_reset_cancel(void);
  * A failed warm-up leaves the existing HTTPS conversation path available. */
 esp_err_t baby_tank_cloud_voice_session_prepare(void);
 void baby_tank_cloud_voice_session_close(void);
+bool baby_tank_cloud_voice_session_active(void);
+bool baby_tank_cloud_text_notice_pending(void);
+void baby_tank_cloud_clear_text_notice(void);
+bool baby_tank_cloud_take_text_notice(char *job_id, size_t capacity);
 
 /* Uploads one utterance; the cloud performs ASR, dialogue, and TTS. */
 esp_err_t baby_tank_cloud_converse_pcm16(
@@ -119,6 +130,25 @@ esp_err_t baby_tank_cloud_converse_pcm16_stream(
     baby_tank_cloud_audio_chunk_cb_t audio_callback, void *context,
     baby_tank_cloud_audio_format_t *format, uint32_t *sample_rate,
     baby_tank_cloud_drive_action_t *action);
+
+/* Cloud-relayed App text enters the same post-ASR dialogue/TTS path. The
+ * head never receives the child's typed text through a local network. */
+esp_err_t baby_tank_cloud_claim_text_turn(char *job_id, size_t capacity);
+/* Keep one HTTPS request pending while the voice runtime is idle. The
+ * predicate is checked between non-blocking I/O steps, so wake/camera can
+ * preempt this transport before opening their own cloud connection. */
+esp_err_t baby_tank_cloud_wait_text_turn(char *job_id, size_t capacity,
+                                        bool (*can_wait)(void));
+void baby_tank_cloud_cancel_text_wait(void);
+esp_err_t baby_tank_cloud_wait_text_idle(uint32_t timeout_ms);
+esp_err_t baby_tank_cloud_converse_text_turn(
+    const char *job_id, baby_tank_cloud_reply_meta_cb_t metadata_callback,
+    baby_tank_cloud_reply_cue_cb_t cue_callback,
+    baby_tank_cloud_audio_chunk_cb_t audio_callback, void *context,
+    baby_tank_cloud_audio_format_t *format, uint32_t *sample_rate,
+    baby_tank_cloud_drive_action_t *action);
+esp_err_t baby_tank_cloud_complete_text_turn(const char *job_id,
+                                             const char *status);
 
 esp_err_t baby_tank_cloud_report_drive_action(
     const baby_tank_cloud_drive_action_t *action,

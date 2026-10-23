@@ -4,8 +4,11 @@ import { WebSocketServer, WebSocket } from 'ws';
 const VOICE_PATH = '/api/device/v1/conversation/ws';
 const UPLOAD_TIMEOUT_MS = 20_000;
 const REPLY_TIMEOUT_MS = 120_000;
-const IDLE_TIMEOUT_MS = 30_000;
-const MAX_PACKET_BYTES = 4_096;
+// Keep the authenticated transport warm across wake-word sessions. Closing
+// after 30 seconds made the next first utterance pay TLS setup again.
+const IDLE_TIMEOUT_MS = 5 * 60_000;
+// Matches the head's 250 ms PCM upload frame with a small protocol margin.
+const MAX_PACKET_BYTES = 8_192;
 
 function validTrait(value) {
   return Number.isInteger(value) && value >= 0 && value <= 100;
@@ -37,8 +40,19 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
     if (path !== VOICE_PATH) return rejectUpgrade(socket, 400);
     const device = authenticate(request.headers.authorization);
     if (!device) return rejectUpgrade(socket, 401);
-    if (sockets.has(device.id)) return rejectUpgrade(socket, 409);
+    const previous = sockets.get(device.id);
+    if (previous) {
+      // A head reboot can leave the old TCP connection looking OPEN until the
+      // kernel keepalive notices the vanished peer. Replace an idle transport
+      // immediately, but never cut off a turn that is uploading or replying.
+      if (previous.readyState === WebSocket.OPEN && previous.babyTankBusy) {
+        return rejectUpgrade(socket, 409);
+      }
+      previous.terminate();
+      sockets.delete(device.id);
+    }
     websocketServer.handleUpgrade(request, socket, head, (ws) => {
+      ws.babyTankBusy = false;
       sockets.set(device.id, ws);
       websocketServer.emit('connection', ws, request, device);
     });
@@ -53,11 +67,13 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
       if (!turn) idleTimer = setTimeout(() => socket.close(1000, 'voice session idle'), IDLE_TIMEOUT_MS);
     };
     const closeTurn = () => {
-      if (!turn) return;
-      clearTimeout(turn.timer);
-      turn.controller.abort();
-      turn.audio.destroy();
-      turn = null;
+      if (turn) {
+        clearTimeout(turn.timer);
+        turn.controller.abort();
+        turn.audio?.destroy();
+        turn = null;
+      }
+      socket.babyTankBusy = false;
       resetIdle();
     };
     const fail = async (status, code) => {
@@ -65,27 +81,29 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
       try { await send(socket, JSON.stringify({ type: 'turn_error', status, code })); }
       catch { socket.terminate(); }
     };
-    const runTurn = async (active, query) => {
+    const runTurn = async (active, path, query, body = null) => {
       try {
         const address = server.address();
         if (!address || typeof address === 'string') throw new Error('voice_listener_unavailable');
-        const url = new URL(`http://127.0.0.1:${address.port}/api/device/v1/conversation/stream`);
+        const url = new URL(`http://127.0.0.1:${address.port}${path}`);
         for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value));
+        const headers = { authorization };
+        if (body) headers['content-type'] = 'audio/pcm';
         const response = await fetch(url, {
-          method: 'POST',
-          headers: { authorization, 'content-type': 'audio/pcm' },
-          body: Readable.toWeb(active.audio), duplex: 'half',
+          method: 'POST', headers,
+          ...(body ? { body, duplex: 'half' } : {}),
           signal: active.controller.signal,
         });
         if (turn !== active) return;
         active.replyAt = performance.now();
-        const headers = {};
+        const responseHeaders = {};
         for (const [key, value] of response.headers) {
           if (key.startsWith('x-ai-') || key === 'x-turn-trace-id' ||
               key === 'x-audio-format' || key === 'x-audio-sample-rate' ||
-              key === 'x-babytank-audio-framing') headers[key] = value;
+              key === 'x-babytank-audio-framing') responseHeaders[key] = value;
         }
-        await send(socket, JSON.stringify({ type: 'reply', status: response.status, headers }));
+        await send(socket, JSON.stringify({ type: 'reply', status: response.status,
+          headers: responseHeaders }));
         if (response.ok && response.body) {
           for await (const chunk of Readable.fromWeb(response.body)) {
             if (turn !== active) return;
@@ -98,6 +116,7 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
         if (turn !== active) return;
         const finishedAt = performance.now();
         console.info(JSON.stringify({ event: 'voice_socket.turn', device: device.id,
+          kind: active.kind,
           status: response.status, inputBytes: active.bytes,
           uploadMs: Math.round((active.uploadDoneAt || finishedAt) - active.startedAt),
           replyAfterUploadMs: active.uploadDoneAt
@@ -106,8 +125,9 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
             ? Math.round(active.firstAudioAt - active.uploadDoneAt) : null,
           totalMs: Math.round(finishedAt - active.startedAt) }));
         clearTimeout(active.timer);
-        turn = null;
         await send(socket, JSON.stringify({ type: 'turn_end' }));
+        turn = null;
+        socket.babyTankBusy = false;
         resetIdle();
       } catch (error) {
         if (turn === active) await fail(502, error.name === 'AbortError'
@@ -148,9 +168,13 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
           if (turn === active) void fail(408, 'voice_turn_timeout');
         }, UPLOAD_TIMEOUT_MS);
         turn = active;
-        void runTurn(active, { format: 'pcm', sampleRate: 16000,
-          wire: 'framed-v1', vision: 'always', curiosity: message.curiosity,
-          warmth: message.warmth, talkativeness: message.talkativeness });
+        socket.babyTankBusy = true;
+        active.kind = 'speech';
+        void runTurn(active, '/api/device/v1/conversation/stream',
+          { format: 'pcm', sampleRate: 16000, wire: 'framed-v1',
+            vision: 'always', curiosity: message.curiosity,
+            warmth: message.warmth, talkativeness: message.talkativeness },
+          Readable.toWeb(active.audio));
       } else if (message.type === 'listen' && message.state === 'stop') {
         if (!turn || turn.uploadDone || turn.bytes < 2) {
           void fail(400, 'voice_audio_invalid');
@@ -165,6 +189,24 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
         turn.audio.end();
       } else if (message.type === 'abort') {
         closeTurn();
+      } else if (message.type === 'text' && message.state === 'start') {
+        if (turn || typeof message.jobId !== 'string' ||
+            !/^[0-9a-f-]{36}$/i.test(message.jobId)) {
+          void fail(409, 'text_turn_invalid');
+          return;
+        }
+        clearTimeout(idleTimer);
+        const active = { kind: 'text', audio: null,
+          controller: new AbortController(), bytes: 0, uploadDone: true,
+          timer: null, startedAt: performance.now(),
+          uploadDoneAt: performance.now(), replyAt: null, firstAudioAt: null };
+        active.timer = setTimeout(() => {
+          if (turn === active) void fail(504, 'voice_reply_timeout');
+        }, REPLY_TIMEOUT_MS);
+        turn = active;
+        socket.babyTankBusy = true;
+        void runTurn(active, '/api/device/v1/conversation/text',
+          { jobId: message.jobId, wire: 'framed-v1', vision: 'always' });
       } else {
         void fail(400, 'voice_message_invalid');
       }
@@ -184,4 +226,14 @@ export function attachVoiceSocket(server, { authenticate, speechMaxBytes }) {
     for (const socket of sockets.values()) socket.terminate();
     websocketServer.close();
   });
+
+  return {
+    notifyTextAvailable(deviceId, jobId) {
+      const socket = sockets.get(deviceId);
+      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+      void send(socket, JSON.stringify({ type: 'text_available', id: jobId }))
+        .catch(() => socket.terminate());
+      return true;
+    },
+  };
 }

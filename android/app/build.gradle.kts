@@ -24,11 +24,12 @@ android {
         applicationId = "com.babytank.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "0.2.3"
+        versionCode = 27
+        versionName = "0.3.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "BABY_TANK_SETUP_POP", "\"$babyTankSetupPop\"")
+        buildConfigField("String", "BABY_TANK_CLOUD_ORIGIN", "\"https://www.xydocshare.com\"")
     }
 
     buildTypes {

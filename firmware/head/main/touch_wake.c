@@ -14,7 +14,8 @@
 #define TOUCH_WAKE_INITIAL_SCANS 3
 #define TOUCH_WAKE_SCAN_TIMEOUT_MS 2000
 #define TOUCH_WAKE_DEBOUNCE_MS 1200
-#define TOUCH_TOP_CONFIRM_MS 120
+#define TOUCH_TOP_CONFIRM_MS 160
+#define TOUCH_TOP_SECOND_SAMPLE_MS 80
 #define TOUCH_SIDE_CONFIRM_MS 120
 #define TOUCH_SIDE_SECOND_SAMPLE_MS 60
 #define TOUCH_SIDE_MIN_DELTA_PER_MILLE 100U
@@ -30,11 +31,9 @@ typedef struct {
 
 static const touch_zone_config_t TOUCH_ZONES[TOUCH_WAKE_CHANNEL_COUNT] = {
     {.channel_id = 1, .zone = BABY_TANK_TOUCH_TOP,
-     /* 25 per mille produced a measured 42 per mille false edge while the
-      * dialogue microphone was active, immediately cancelling the turn.
-      * The vendor BSP uses 40; keep additional margin for chassis/audio
-      * coupling and require a sustained edge below. */
-     .threshold_per_mille = 50U, .name = "top"},
+     /* A real press is about 38 per mille on this board. Give it margin,
+      * while requiring two sustained samples to reject brief coupled edges. */
+     .threshold_per_mille = 22U, .name = "top"},
     {.channel_id = 2, .zone = BABY_TANK_TOUCH_LEFT,
      .threshold_per_mille = 100U, .name = "left"},
     {.channel_id = 3, .zone = BABY_TANK_TOUCH_RIGHT,
@@ -98,7 +97,7 @@ static void log_top_touch_sample(const char *reason)
     ESP_LOGI(TAG, "top touch sample %s smooth=%lu baseline=%lu delta=%ld active=%u",
              reason, (unsigned long)smooth[0],
              (unsigned long)benchmark[0],
-             (long)benchmark[0] - (long)smooth[0],
+             (long)smooth[0] - (long)benchmark[0],
              (unsigned)((s_active_latch & (1UL << 1)) != 0U));
 }
 
@@ -139,13 +138,17 @@ static void touch_wake_task(void *argument)
     (void)argument;
     TickType_t last_wake[TOUCH_WAKE_CHANNEL_COUNT] = {0};
     TickType_t last_log = 0;
+    TickType_t task_started = xTaskGetTickCount();
     while (true) {
         uint32_t active_channels = 0;
         if (xTaskNotifyWait(0, UINT32_MAX, &active_channels,
                             pdMS_TO_TICKS(250)) != pdTRUE) {
             update_touch_snapshot();
             TickType_t now = xTaskGetTickCount();
-            if (last_log == 0 || now - last_log >= pdMS_TO_TICKS(5000)) {
+            TickType_t sample_interval = now - task_started <
+                pdMS_TO_TICKS(60000U) ? pdMS_TO_TICKS(1000U) :
+                pdMS_TO_TICKS(5000U);
+            if (last_log == 0 || now - last_log >= sample_interval) {
                 log_top_touch_sample("idle");
                 last_log = now;
             }
@@ -159,10 +162,26 @@ static void touch_wake_task(void *argument)
             if (zone->zone == BABY_TANK_TOUCH_TOP) {
                 /* A single low-threshold sample caused unintended
                  * barge-ins while ASR was uploading. Require a held touch. */
-                vTaskDelay(pdMS_TO_TICKS(TOUCH_TOP_CONFIRM_MS));
-                if ((s_active_latch & (1UL << zone->channel_id)) == 0U) {
-                    continue;
+                bool confirmed = true;
+                for (uint8_t sample = 0U; sample < 2U; ++sample) {
+                    vTaskDelay(pdMS_TO_TICKS(sample == 0U
+                        ? TOUCH_TOP_CONFIRM_MS : TOUCH_TOP_SECOND_SAMPLE_MS));
+                    update_touch_snapshot();
+                    uint16_t delta;
+                    portENTER_CRITICAL(&s_snapshot_lock);
+                    delta = s_snapshot.delta_per_mille[index];
+                    portEXIT_CRITICAL(&s_snapshot_lock);
+                    if ((s_active_latch & (1UL << zone->channel_id)) == 0U ||
+                        delta < zone->threshold_per_mille) {
+                        ESP_LOGI(TAG, "top touch rejected sample=%u delta=%u active=%u",
+                                 (unsigned)sample, (unsigned)delta,
+                                 (unsigned)((s_active_latch &
+                                     (1UL << zone->channel_id)) != 0U));
+                        confirmed = false;
+                        break;
+                    }
                 }
+                if (!confirmed) continue;
                 log_top_touch_sample("held");
             } else {
                 /* Side pads have shown chassis-coupled false edges. Require

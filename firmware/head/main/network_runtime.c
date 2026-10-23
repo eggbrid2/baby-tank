@@ -29,6 +29,8 @@
 #include "diagnostics.h"
 #include "face_controller.h"
 #include "voice_runtime.h"
+#include "runtime_policy.h"
+#include "state_event_queue.h"
 #include "wifi_portal.h"
 
 #define NETWORK_CONNECTED_BIT BIT0
@@ -37,6 +39,8 @@
 #define SOFTAP_SSID_CAPACITY 24U
 #define SOFTAP_PASSWORD_CAPACITY 17U
 #define SOFTAP_CHANNEL 6U
+#define WIFI_CANDIDATE_RETRY_DELAY_US 1000000ULL
+#define WIFI_CONNECTED_RETRY_DELAY_US 3000000ULL
 
 static const char *TAG = "baby_tank_network";
 static EventGroupHandle_t s_events;
@@ -45,7 +49,10 @@ static bool s_provisioning_active;
 static bool s_manager_initialized;
 static bool s_softap_ready;
 static bool s_camera_hotspot_requested;
+static bool s_setup_hotspot_requested;
 static bool s_wifi_sleep_power_save;
+static volatile bool s_wifi_enabled = true;
+static volatile bool s_wifi_transition;
 static volatile baby_tank_web_wifi_phase_t s_web_wifi_phase;
 static volatile int s_last_wifi_reason;
 static volatile int s_web_failure_reason;
@@ -55,10 +62,16 @@ static esp_timer_handle_t s_probe_retry_timer;
 static volatile baby_tank_internet_phase_t s_internet_phase;
 static volatile int s_internet_http_status;
 static bool s_probe_busy;
+static volatile bool s_online_finalize_busy;
 static wifi_config_t s_softap_config;
 static char s_setup_pop[BABY_TANK_SETUP_POP_CAPACITY];
 static char s_pending_ssid[BABY_TANK_WIFI_SSID_CAPACITY];
 static char s_pending_password[BABY_TANK_WIFI_PASSWORD_CAPACITY];
+static baby_tank_wifi_profile_t s_saved_profiles[BABY_TANK_WIFI_PROFILE_MAX];
+static size_t s_saved_profile_count;
+static size_t s_saved_profile_index;
+static bool s_retry_current_profile_once;
+static bool s_station_had_ip;
 typedef struct {
     char ssid[BABY_TANK_WIFI_SSID_CAPACITY];
     char password[BABY_TANK_WIFI_PASSWORD_CAPACITY];
@@ -70,6 +83,10 @@ static uint8_t s_provisioning_service_uuid[16] = {
 
 esp_err_t baby_tank_network_set_sleep_power_save(bool sleeping)
 {
+    if (!s_wifi_enabled) {
+        s_wifi_sleep_power_save = sleeping;
+        return ESP_OK;
+    }
     wifi_ps_type_t mode = sleeping ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
     esp_err_t result = esp_wifi_set_ps(mode);
     if (result == ESP_OK && s_wifi_sleep_power_save != sleeping) {
@@ -151,6 +168,10 @@ static esp_err_t configure_softap(const char *setup_pop)
 
 esp_err_t baby_tank_network_enable_camera_hotspot(void)
 {
+    ESP_RETURN_ON_FALSE(s_wifi_enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "camera requires Wi-Fi to be enabled");
+    ESP_RETURN_ON_FALSE(!baby_tank_policy_is_locked(), ESP_ERR_INVALID_STATE,
+                        TAG, "camera is unavailable during deep-night lock");
     ESP_RETURN_ON_FALSE(s_setup_pop[0] != '\0', ESP_ERR_INVALID_STATE, TAG,
                         "secure setup code is unavailable");
     s_camera_hotspot_requested = true;
@@ -158,6 +179,12 @@ esp_err_t baby_tank_network_enable_camera_hotspot(void)
     if (!s_softap_ready) {
         result = configure_softap(s_setup_pop);
         if (result == ESP_OK) result = baby_tank_wifi_portal_restart();
+        if (result == ESP_OK && baby_tank_camera_stream_is_ready()) {
+            /* Restarting the AP listener discards its URI table. Remote mode
+             * may already have started the camera for the LAN listener, so
+             * reattach /stream instead of trying to start it twice. */
+            result = baby_tank_camera_stream_register_ap_routes();
+        }
     }
     if (result == ESP_OK && !baby_tank_camera_stream_is_ready()) {
         ESP_RETURN_ON_FALSE(baby_tank_voice_runtime_remote_mode(),
@@ -167,6 +194,69 @@ esp_err_t baby_tank_network_enable_camera_hotspot(void)
     }
     if (result != ESP_OK) s_camera_hotspot_requested = false;
     return result;
+}
+
+esp_err_t baby_tank_network_set_setup_hotspot(bool enabled)
+{
+    ESP_RETURN_ON_FALSE(s_wifi_enabled && s_events != NULL,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "Wi-Fi runtime is unavailable");
+    ESP_RETURN_ON_FALSE(s_setup_pop[0] != '\0', ESP_ERR_INVALID_STATE, TAG,
+                        "secure setup code is unavailable");
+    if (enabled == s_setup_hotspot_requested &&
+        (enabled == s_softap_ready || !enabled)) return ESP_OK;
+
+    if (enabled) {
+        s_setup_hotspot_requested = true;
+        esp_err_t result = ESP_OK;
+        if (!s_softap_ready) {
+            result = configure_softap(s_setup_pop);
+            if (result == ESP_OK) result = baby_tank_wifi_portal_restart();
+            if (result == ESP_OK && baby_tank_camera_stream_is_ready()) {
+                result = baby_tank_camera_stream_register_ap_routes();
+            }
+        }
+        if (result != ESP_OK) s_setup_hotspot_requested = false;
+        if (result == ESP_OK) {
+            ESP_LOGI(TAG, "setup hotspot enabled by authenticated BLE command");
+        }
+        return result;
+    }
+
+    s_setup_hotspot_requested = false;
+    /* The camera fallback has its own lease on the same AP. Closing the
+     * provisioning switch must not tear down an active direct video link. */
+    if (s_camera_hotspot_requested) return ESP_OK;
+    esp_err_t result = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (result == ESP_OK) {
+        s_softap_ready = false;
+        ESP_LOGI(TAG, "setup hotspot disabled; station Wi-Fi kept online");
+    }
+    return result;
+}
+
+bool baby_tank_network_setup_hotspot_is_enabled(void)
+{
+    return s_setup_hotspot_requested;
+}
+
+void baby_tank_network_release_camera_hotspot(void)
+{
+    s_camera_hotspot_requested = false;
+    /* Preserve the ordinary first-boot/offline setup path. Once the station
+     * is known online, a camera-only AP can be removed after remote mode. */
+    if (!s_setup_hotspot_requested && s_softap_ready &&
+        baby_tank_network_is_connected() &&
+        s_internet_phase == BABY_TANK_INTERNET_ONLINE) {
+        esp_err_t result = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (result == ESP_OK) {
+            s_softap_ready = false;
+            ESP_LOGI(TAG, "camera hotspot released; station Wi-Fi kept online");
+        } else {
+            ESP_LOGW(TAG, "unable to release camera hotspot: %s",
+                     esp_err_to_name(result));
+        }
+    }
 }
 
 static esp_err_t control_endpoint(uint32_t session_id, const uint8_t *input,
@@ -181,7 +271,14 @@ static esp_err_t control_endpoint(uint32_t session_id, const uint8_t *input,
     bool valid = input_size >= 0 &&
                  baby_tank_control_parse(input, (size_t)input_size, &request);
     baby_tank_control_status_t status = BABY_TANK_CONTROL_INVALID;
-    if (valid) (void)baby_tank_face_note_activity();
+    /* Link keepalives and STOP are not child interaction. The App sends STOP
+     * when it backgrounds even if the motors are already stopped; it must
+     * remain effective without ending a long idle scene. */
+    if (valid && request.opcode != BABY_TANK_CONTROL_PING &&
+        request.opcode != BABY_TANK_CONTROL_STOP &&
+        !baby_tank_policy_is_locked()) {
+        (void)baby_tank_face_note_activity();
+    }
     if (valid && request.opcode == BABY_TANK_CONTROL_PING) {
         status = BABY_TANK_CONTROL_OK;
     } else if (valid && request.opcode == BABY_TANK_CONTROL_STOP) {
@@ -189,6 +286,8 @@ static esp_err_t control_endpoint(uint32_t session_id, const uint8_t *input,
                      ? BABY_TANK_CONTROL_OK : BABY_TANK_CONTROL_UNAVAILABLE;
         ESP_LOGI(TAG, "BLE stop sequence=%u status=%u",
                  request.sequence, status);
+    } else if (valid && baby_tank_policy_is_locked()) {
+        status = BABY_TANK_CONTROL_UNAVAILABLE;
     } else if (valid && request.opcode == BABY_TANK_CONTROL_DRIVE) {
         status = baby_tank_chassis_bridge_drive(request.left_per_mille,
                                                  request.right_per_mille) == ESP_OK
@@ -237,8 +336,10 @@ static esp_err_t personality_endpoint(uint32_t session_id, const uint8_t *input,
             .curiosity = input[1], .warmth = input[2],
             .talkativeness = input[3],
         };
-        response[1] = baby_tank_cloud_set_personality(personality) == ESP_OK
-                          ? 0U : 1U;
+        /* Older phones may still send this BLE write. Once cloud policy is
+         * versioned, stale local writes must not override newer settings. */
+        response[1] = baby_tank_cloud_personality_revision() > 0U ? 2U :
+            (baby_tank_cloud_set_personality(personality) == ESP_OK ? 0U : 1U);
     }
     baby_tank_personality_t current = baby_tank_cloud_get_personality();
     response[2] = current.curiosity;
@@ -312,6 +413,12 @@ static esp_err_t camera_info_endpoint(uint32_t session_id,
     ESP_RETURN_ON_FALSE(response != NULL, ESP_ERR_NO_MEM, TAG,
                         "camera info allocation failed");
     response[0] = 1;
+    if (baby_tank_policy_is_locked()) {
+        response[1] = 2;
+        *output = response;
+        *output_size = 22;
+        return ESP_OK;
+    }
     if (input[0] == 2 && baby_tank_network_enable_camera_hotspot() != ESP_OK) {
         response[1] = 2;
         *output = response;
@@ -327,17 +434,103 @@ static esp_err_t camera_info_endpoint(uint32_t session_id,
     return ESP_OK;
 }
 
+/* The encrypted provisioning session supplies a stable cloud identity so the
+ * phone cannot attribute a child's interaction to a different paired robot.
+ * The token itself is never sent over this endpoint. */
+static esp_err_t identity_endpoint(uint32_t session_id,
+                                   const uint8_t *input, ssize_t input_size,
+                                   uint8_t **output, ssize_t *output_size,
+                                   void *context)
+{
+    (void)session_id;
+    (void)context;
+    ESP_RETURN_ON_FALSE(input != NULL && input_size == 1 && input[0] == 1 &&
+                            output != NULL && output_size != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid identity request");
+    char verified_id[65] = {0};
+    bool verified = baby_tank_cloud_copy_verified_device_id(
+        verified_id, sizeof(verified_id)) == ESP_OK;
+    size_t id_length = verified ? strlen(verified_id) : 0U;
+    uint8_t *response = malloc(id_length + 2U);
+    ESP_RETURN_ON_FALSE(response != NULL, ESP_ERR_NO_MEM, TAG,
+                        "identity response allocation failed");
+    response[0] = 1U;
+    response[1] = (uint8_t)id_length;
+    if (id_length > 0U) memcpy(response + 2U, verified_id, id_length);
+    *output = response;
+    *output_size = (ssize_t)(id_length + 2U);
+    return ESP_OK;
+}
+
 static void clear_pending_wifi(void)
 {
     memset(s_pending_ssid, 0, sizeof(s_pending_ssid));
     memset(s_pending_password, 0, sizeof(s_pending_password));
 }
 
+static void reload_saved_profiles(void)
+{
+    size_t count = 0U;
+    esp_err_t result = baby_tank_wifi_profiles_load(s_saved_profiles,
+        BABY_TANK_WIFI_PROFILE_MAX, &count);
+    s_saved_profile_count = result == ESP_OK ? count : 0U;
+    s_saved_profile_index = 0U;
+    s_retry_current_profile_once = false;
+    if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "saved Wi-Fi profiles unavailable: %s",
+                 esp_err_to_name(result));
+    } else {
+        ESP_LOGI(TAG, "saved Wi-Fi profiles=%u",
+                 (unsigned)s_saved_profile_count);
+    }
+}
+
+static esp_err_t select_saved_profile(size_t index)
+{
+    if (index >= s_saved_profile_count) return ESP_ERR_NOT_FOUND;
+    const baby_tank_wifi_profile_t *profile = &s_saved_profiles[index];
+    wifi_config_t config = {0};
+    memcpy(config.sta.ssid, profile->ssid, strlen(profile->ssid));
+    memcpy(config.sta.password, profile->password,
+           strlen(profile->password));
+    config.sta.threshold.authmode = profile->password[0] == '\0'
+                                        ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    /* Mesh systems advertise one SSID from several BSSIDs. Fast scan stops
+     * at the first acceptable AP and can leave the ESP32 attached to a much
+     * worse node than the nearby phone. Scan every channel and select by RSSI
+     * so local camera traffic does not take a slow mesh backhaul path. */
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+    /* Candidate rotation must not rewrite the Wi-Fi driver's NVS on every
+     * failure. The profile list itself is persisted only after provisioning. */
+    esp_err_t result = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (result == ESP_OK) result = esp_wifi_set_config(WIFI_IF_STA, &config);
+    memset(&config, 0, sizeof(config));
+    if (result == ESP_OK) {
+        s_saved_profile_index = index;
+        ESP_LOGI(TAG, "trying saved Wi-Fi %u/%u: %s",
+                 (unsigned)(index + 1U), (unsigned)s_saved_profile_count,
+                 profile->ssid);
+    }
+    return result;
+}
+
 static void retry_saved_wifi(void *argument)
 {
     (void)argument;
-    if (!s_provisioning_active && !baby_tank_network_is_connected()) {
-        esp_err_t result = esp_wifi_connect();
+    if (s_wifi_enabled && !s_provisioning_active &&
+        !baby_tank_network_is_connected()) {
+        esp_err_t result = ESP_OK;
+        if (s_retry_current_profile_once) {
+            s_retry_current_profile_once = false;
+        } else if (s_saved_profile_count > 1U) {
+            size_t next = (s_saved_profile_index + 1U) %
+                          s_saved_profile_count;
+            result = select_saved_profile(next);
+        }
+        if (result == ESP_OK) result = esp_wifi_connect();
         if (result != ESP_OK) {
             ESP_LOGW(TAG, "saved Wi-Fi retry failed: %s",
                      esp_err_to_name(result));
@@ -386,6 +579,75 @@ static int probe_plain_http_transport(esp_err_t *request_result)
     return status;
 }
 
+static void online_finalize_worker(void *argument)
+{
+    (void)argument;
+    if (baby_tank_network_is_connected() && !s_provisioning_active &&
+        !s_web_wifi_busy && s_saved_profile_index > 0U &&
+        s_saved_profile_index < s_saved_profile_count) {
+        const baby_tank_wifi_profile_t *working =
+            &s_saved_profiles[s_saved_profile_index];
+        esp_err_t promoted = baby_tank_wifi_credentials_store(
+            working->ssid, working->password);
+        if (promoted == ESP_OK) {
+            ESP_LOGI(TAG, "internet-verified Wi-Fi promoted for next boot");
+            reload_saved_profiles();
+        } else {
+            ESP_LOGW(TAG, "working Wi-Fi promotion failed: %s",
+                     esp_err_to_name(promoted));
+        }
+    }
+    /* Let the setup page display the successful result before closing the AP. */
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    if (s_internet_phase == BABY_TANK_INTERNET_ONLINE &&
+        baby_tank_network_is_connected() && !s_web_wifi_busy &&
+        !s_camera_hotspot_requested && !s_setup_hotspot_requested) {
+        esp_err_t mode_result = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_result == ESP_OK) {
+            s_softap_ready = false;
+            ESP_LOGI(TAG, "internet verified; setup hotspot stopped");
+        } else {
+            ESP_LOGW(TAG, "unable to stop setup hotspot: %s",
+                     esp_err_to_name(mode_result));
+        }
+    }
+    s_online_finalize_busy = false;
+    vTaskDelete(NULL);
+}
+
+void baby_tank_network_cloud_transport_verified(void)
+{
+    if (!baby_tank_network_is_connected()) return;
+    bool newly_online = s_internet_phase != BABY_TANK_INTERNET_ONLINE;
+    s_internet_phase = BABY_TANK_INTERNET_ONLINE;
+    if (s_internet_http_status == 0) s_internet_http_status = 101;
+    if (newly_online) {
+        ESP_LOGI(TAG, "authenticated cloud WebSocket verified internet");
+    }
+    if (newly_online && !s_online_finalize_busy) {
+        s_online_finalize_busy = true;
+        if (xTaskCreate(online_finalize_worker, "online_finalize", 4096U,
+                        NULL, 3, NULL) != pdPASS) {
+            s_online_finalize_busy = false;
+            ESP_LOGW(TAG, "unable to schedule online network finalization");
+        }
+    }
+}
+
+void baby_tank_network_cloud_transport_failed(void)
+{
+    if (!baby_tank_network_is_connected() ||
+        s_internet_phase != BABY_TANK_INTERNET_TESTING || s_probe_busy) return;
+    ESP_LOGW(TAG,
+             "authenticated cloud WebSocket unavailable; running portal diagnostic");
+    (void)baby_tank_network_test_internet_async();
+}
+
+bool baby_tank_network_internet_probe_busy(void)
+{
+    return s_probe_busy;
+}
+
 static void internet_probe_worker(void *argument)
 {
     (void)argument;
@@ -423,7 +685,7 @@ static void internet_probe_worker(void *argument)
         s_internet_phase = BABY_TANK_INTERNET_OFFLINE;
     } else if (result == ESP_OK && status == 200 &&
                strstr(response.body, "\"service\":\"baby-tank-cloud\"") != NULL) {
-        s_internet_phase = BABY_TANK_INTERNET_ONLINE;
+        baby_tank_network_cloud_transport_verified();
         ESP_LOGI(TAG, "Baby Tank cloud health probe passed");
     } else if (result == ESP_OK && status >= 300 && status < 400) {
         s_internet_phase = BABY_TANK_INTERNET_PORTAL;
@@ -450,22 +712,6 @@ static void internet_probe_worker(void *argument)
                      "plain=%s",
                      esp_err_to_name(result), status,
                      esp_err_to_name(plain_result));
-        }
-    }
-    if (s_internet_phase == BABY_TANK_INTERNET_ONLINE) {
-        /* Let the setup page display the result before closing the AP. */
-        vTaskDelay(pdMS_TO_TICKS(10000));
-        if (s_internet_phase == BABY_TANK_INTERNET_ONLINE &&
-            baby_tank_network_is_connected() && !s_web_wifi_busy &&
-            !s_camera_hotspot_requested) {
-            esp_err_t mode_result = esp_wifi_set_mode(WIFI_MODE_STA);
-            if (mode_result == ESP_OK) {
-                s_softap_ready = false;
-                ESP_LOGI(TAG, "internet verified; setup hotspot stopped");
-            } else {
-                ESP_LOGW(TAG, "unable to stop setup hotspot: %s",
-                         esp_err_to_name(mode_result));
-            }
         }
     }
     s_probe_busy = false;
@@ -518,10 +764,15 @@ static void network_event(void *argument, esp_event_base_t base,
 {
     (void)argument;
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (!s_provisioning_active) esp_wifi_connect();
+        if (s_wifi_enabled && !s_provisioning_active) esp_wifi_connect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         s_last_wifi_reason = 0;
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        bool had_ip = s_station_had_ip;
+        if (s_station_had_ip) {
+            s_retry_current_profile_once = true;
+            s_station_had_ip = false;
+        }
         if (s_probe_retry_timer != NULL &&
             esp_timer_is_active(s_probe_retry_timer)) {
             esp_timer_stop(s_probe_retry_timer);
@@ -530,6 +781,10 @@ static void network_event(void *argument, esp_event_base_t base,
         if (disconnected != NULL) s_last_wifi_reason = disconnected->reason;
         xEventGroupClearBits(s_events, NETWORK_CONNECTED_BIT);
         s_internet_phase = BABY_TANK_INTERNET_OFFLINE;
+        if (!s_wifi_enabled) {
+            ESP_LOGI(TAG, "Wi-Fi stopped by App; automatic reconnect suppressed");
+            return;
+        }
         if (!s_softap_ready) {
             char setup_code[BABY_TANK_SETUP_POP_CAPACITY] = {0};
             if (baby_tank_device_setup_pop_load(setup_code,
@@ -548,11 +803,20 @@ static void network_event(void *argument, esp_event_base_t base,
                 esp_timer_stop(s_reconnect_timer);
             }
             if (s_reconnect_timer != NULL) {
-                esp_timer_start_once(s_reconnect_timer, 30000000);
+                esp_timer_start_once(
+                    s_reconnect_timer,
+                    had_ip ? WIFI_CONNECTED_RETRY_DELAY_US
+                           : WIFI_CANDIDATE_RETRY_DELAY_US);
             }
-            ESP_LOGW(TAG, "Wi-Fi disconnected; retrying saved network in 30 s");
+            ESP_LOGW(TAG,
+                     "Wi-Fi disconnected reason=%d; %s saved network in %u ms",
+                     s_last_wifi_reason,
+                     had_ip ? "retrying current" : "rotating to next",
+                     had_ip ? 3000U : 1000U);
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (!s_wifi_enabled) return;
+        s_station_had_ip = true;
         if (s_probe_retry_timer != NULL &&
             esp_timer_is_active(s_probe_retry_timer)) {
             esp_timer_stop(s_probe_retry_timer);
@@ -560,7 +824,11 @@ static void network_event(void *argument, esp_event_base_t base,
         s_last_wifi_reason = 0;
         xEventGroupSetBits(s_events, NETWORK_CONNECTED_BIT);
         ESP_LOGI(TAG, "Wi-Fi connected");
-        if (!s_probe_busy) baby_tank_network_test_internet_async();
+        /* The authenticated long-lived WebSocket is the normal connectivity
+         * proof. Starting an HTTPS health request here duplicated the full
+         * TLS handshake and delayed every boot by roughly six seconds. */
+        s_internet_http_status = 0;
+        s_internet_phase = BABY_TANK_INTERNET_TESTING;
     } else if (base == NETWORK_PROV_EVENT) {
         switch (event_id) {
         case NETWORK_PROV_START:
@@ -598,6 +866,8 @@ static void network_event(void *argument, esp_event_base_t base,
                 if (store_result != ESP_OK) {
                     ESP_LOGW(TAG, "unable to mirror Wi-Fi state: %s",
                              esp_err_to_name(store_result));
+                } else {
+                    reload_saved_profiles();
                 }
             }
             clear_pending_wifi();
@@ -661,21 +931,24 @@ static esp_err_t migrate_legacy_wifi_if_present(void)
     ESP_RETURN_ON_ERROR(result, TAG, "legacy Wi-Fi load failed");
 
     wifi_config_t config = {0};
-    strlcpy((char *)config.sta.ssid, credentials.wifi_ssid,
-            sizeof(config.sta.ssid));
-    strlcpy((char *)config.sta.password, credentials.wifi_password,
-            sizeof(config.sta.password));
+    memcpy(config.sta.ssid, credentials.wifi_ssid,
+           strlen(credentials.wifi_ssid));
+    memcpy(config.sta.password, credentials.wifi_password,
+           strlen(credentials.wifi_password));
     config.sta.threshold.authmode = credentials.wifi_password[0] == '\0'
                                         ? WIFI_AUTH_OPEN
                                         : WIFI_AUTH_WPA2_PSK;
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     config.sta.pmf_cfg.capable = true;
     config.sta.pmf_cfg.required = false;
-    memset(&credentials, 0, sizeof(credentials));
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(s_softap_ready ? WIFI_MODE_APSTA
                                                         : WIFI_MODE_STA), TAG,
                         "legacy Wi-Fi mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &config), TAG,
                         "legacy Wi-Fi migration failed");
+    ESP_LOGI(TAG, "restored Wi-Fi SSID: %s", credentials.wifi_ssid);
+    memset(&credentials, 0, sizeof(credentials));
     memset(&config, 0, sizeof(config));
     ESP_LOGI(TAG, "migrated existing Wi-Fi settings to IDF provisioning store");
     return ESP_OK;
@@ -696,12 +969,13 @@ static void web_wifi_worker(void *argument)
     s_last_wifi_reason = 0;
 
     wifi_config_t config = {0};
-    strlcpy((char *)config.sta.ssid, request->ssid,
-            sizeof(config.sta.ssid));
-    strlcpy((char *)config.sta.password, request->password,
-            sizeof(config.sta.password));
+    memcpy(config.sta.ssid, request->ssid, strlen(request->ssid));
+    memcpy(config.sta.password, request->password,
+           strlen(request->password));
     config.sta.threshold.authmode = request->password[0] == '\0'
                                         ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     config.sta.pmf_cfg.capable = true;
     config.sta.pmf_cfg.required = false;
     esp_err_t result = esp_wifi_set_mode(WIFI_MODE_APSTA);
@@ -719,6 +993,7 @@ static void web_wifi_worker(void *argument)
                                                    request->password);
         if (result == ESP_OK) {
             s_web_wifi_phase = BABY_TANK_WEB_WIFI_GOT_IP;
+            reload_saved_profiles();
             ESP_LOGI(TAG, "web Wi-Fi setup connected and saved: %s", request->ssid);
         }
     }
@@ -730,6 +1005,14 @@ static void web_wifi_worker(void *argument)
         vTaskDelay(pdMS_TO_TICKS(200));
         /* A failed candidate must not replace the last working network. */
         esp_err_t restore = migrate_legacy_wifi_if_present();
+        if (restore == ESP_OK) {
+            s_saved_profile_index = 0U;
+            esp_err_t reconnect = esp_wifi_connect();
+            if (reconnect != ESP_OK) {
+                ESP_LOGW(TAG, "previous Wi-Fi reconnect failed: %s",
+                         esp_err_to_name(reconnect));
+            }
+        }
         s_web_wifi_phase = BABY_TANK_WEB_WIFI_FAILED;
         if (restore != ESP_OK) {
             ESP_LOGW(TAG, "previous Wi-Fi restore failed: %s",
@@ -749,6 +1032,8 @@ esp_err_t baby_tank_network_configure_wifi_async(const char *ssid,
 {
     ESP_RETURN_ON_FALSE(ssid != NULL && password != NULL && s_events != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid web setup request");
+    ESP_RETURN_ON_FALSE(s_wifi_enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "Wi-Fi is disabled");
     size_t ssid_length = strlen(ssid);
     size_t password_length = strlen(password);
     ESP_RETURN_ON_FALSE(ssid_length > 0 && ssid_length < BABY_TANK_WIFI_SSID_CAPACITY &&
@@ -790,7 +1075,8 @@ esp_err_t baby_tank_network_scan_wifi(wifi_ap_record_t *records,
                                       uint16_t *record_count)
 {
     ESP_RETURN_ON_FALSE(records != NULL && record_count != NULL &&
-                            *record_count > 0 && !s_web_wifi_busy,
+                            *record_count > 0 && !s_web_wifi_busy &&
+                            s_wifi_enabled,
                         ESP_ERR_INVALID_ARG, TAG, "Wi-Fi scan unavailable");
     bool was_provisioning = s_provisioning_active;
     s_provisioning_active = true;
@@ -808,7 +1094,8 @@ esp_err_t baby_tank_network_scan_wifi(wifi_ap_record_t *records,
     if (!was_provisioning && s_reconnect_timer != NULL &&
         !esp_timer_is_active(s_reconnect_timer) &&
         !baby_tank_network_is_connected()) {
-        esp_timer_start_once(s_reconnect_timer, 30000000);
+        esp_timer_start_once(s_reconnect_timer,
+                             WIFI_CANDIDATE_RETRY_DELAY_US);
     }
     return result;
 }
@@ -838,7 +1125,9 @@ static esp_err_t start_ble_provisioning(
         "ble-control-v1",
         "ble-personality-v1",
         "ble-diagnostics-v1",
+        "ble-identity-v1",
         "device-volume-v1",
+        "wifi-power-v1",
         "safe-stop-required",
         "head-only",
     };
@@ -857,6 +1146,8 @@ static esp_err_t start_ble_provisioning(
                         TAG, "unable to create camera info endpoint");
     ESP_RETURN_ON_ERROR(network_prov_mgr_endpoint_create("baby-diagnostics"),
                         TAG, "unable to create diagnostics endpoint");
+    ESP_RETURN_ON_ERROR(network_prov_mgr_endpoint_create("baby-identity"),
+                        TAG, "unable to create identity endpoint");
     ESP_RETURN_ON_ERROR(network_prov_mgr_disable_auto_stop(1000), TAG,
                         "unable to keep BLE control online");
     s_provisioning_active = true;
@@ -885,6 +1176,9 @@ static esp_err_t start_ble_provisioning(
                             "baby-diagnostics",
                             baby_tank_diagnostics_endpoint, NULL),
                         TAG, "unable to register diagnostics endpoint");
+    ESP_RETURN_ON_ERROR(network_prov_mgr_endpoint_register(
+                            "baby-identity", identity_endpoint, NULL),
+                        TAG, "unable to register identity endpoint");
     /* Provisioning starts Wi-Fi in station mode. Restore APSTA afterwards so
      * the camera network and encrypted BLE session coexist. */
     return configure_softap(identity->setup_pop);
@@ -894,13 +1188,26 @@ esp_err_t baby_tank_network_start(void)
 {
     ESP_RETURN_ON_FALSE(s_events == NULL, ESP_ERR_INVALID_STATE, TAG,
                         "network runtime already started");
+    baby_tank_device_credentials_t identity = {0};
+    /* The identity loader initializes NVS without erasing saved Wi-Fi. */
+    esp_err_t identity_result = baby_tank_device_identity_load(&identity);
+    esp_err_t policy_result = baby_tank_policy_init();
+    if (policy_result != ESP_OK) {
+        ESP_LOGE(TAG, "stored interaction policy unavailable: %s",
+                 esp_err_to_name(policy_result));
+        return policy_result;
+    }
+    esp_err_t queue_result = baby_tank_state_events_init();
+    if (queue_result != ESP_OK) {
+        ESP_LOGE(TAG, "stored character event queue unavailable: %s",
+                 esp_err_to_name(queue_result));
+        return queue_result;
+    }
     esp_err_t chassis_result = baby_tank_chassis_bridge_start();
     if (chassis_result != ESP_OK) {
         ESP_LOGW(TAG, "chassis UART bridge unavailable: %s",
                  esp_err_to_name(chassis_result));
     }
-    baby_tank_device_credentials_t identity = {0};
-    esp_err_t identity_result = baby_tank_device_identity_load(&identity);
     if (identity_result == ESP_OK) {
         esp_err_t cloud_result = baby_tank_cloud_init(identity.device_token);
         if (cloud_result == ESP_OK) {
@@ -924,6 +1231,7 @@ esp_err_t baby_tank_network_start(void)
                         "unable to create network event group");
     ESP_RETURN_ON_ERROR(initialize_platform_network(), TAG,
                         "network platform init failed");
+    reload_saved_profiles();
     const esp_timer_create_args_t retry_timer_args = {
         .callback = retry_saved_wifi,
         .name = "saved_wifi_retry",
@@ -1010,8 +1318,93 @@ esp_err_t baby_tank_network_wait_connected(uint32_t timeout_ms)
 
 bool baby_tank_network_is_connected(void)
 {
-    return s_events != NULL &&
+    return s_wifi_enabled && s_events != NULL &&
            (xEventGroupGetBits(s_events) & NETWORK_CONNECTED_BIT) != 0U;
+}
+
+bool baby_tank_network_is_enabled(void)
+{
+    return s_events != NULL && s_wifi_enabled;
+}
+
+esp_err_t baby_tank_network_set_enabled(bool enabled)
+{
+    ESP_RETURN_ON_FALSE(s_events != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "network runtime is not started");
+    if (enabled == s_wifi_enabled && !s_wifi_transition) return ESP_OK;
+    ESP_RETURN_ON_FALSE(!s_wifi_transition && !s_web_wifi_busy,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "Wi-Fi transition is already busy");
+    s_wifi_transition = true;
+
+    if (!enabled) {
+        /* Set the gate before disconnecting so WIFI_EVENT_STA_DISCONNECTED
+         * cannot schedule a reconnect or recreate the setup hotspot. */
+        s_wifi_enabled = false;
+        if (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer)) {
+            (void)esp_timer_stop(s_reconnect_timer);
+        }
+        if (s_probe_retry_timer != NULL && esp_timer_is_active(s_probe_retry_timer)) {
+            (void)esp_timer_stop(s_probe_retry_timer);
+        }
+
+        /* Camera and cloud activity must release their sockets before the
+         * driver disappears. Leaving remote mode also restores the voice
+         * runtime, then the explicit cancel returns it to a clean idle state. */
+        if (baby_tank_voice_runtime_remote_mode()) {
+            (void)baby_tank_voice_runtime_set_remote_mode(false);
+        }
+        (void)baby_tank_voice_runtime_cancel_conversation();
+        baby_tank_cloud_cancel_current();
+        baby_tank_cloud_voice_session_close();
+        if (baby_tank_camera_stream_is_ready()) {
+            (void)baby_tank_camera_stream_stop();
+        }
+        (void)baby_tank_wifi_portal_stop();
+        (void)esp_wifi_disconnect();
+        esp_err_t result = esp_wifi_stop();
+        if (result == ESP_OK) {
+            xEventGroupClearBits(s_events, NETWORK_CONNECTED_BIT);
+            s_station_had_ip = false;
+            s_softap_ready = false;
+            s_camera_hotspot_requested = false;
+            s_internet_phase = BABY_TANK_INTERNET_OFFLINE;
+            s_internet_http_status = 0;
+            ESP_LOGI(TAG, "Wi-Fi disabled by authenticated BLE command");
+        } else {
+            s_wifi_enabled = true;
+            ESP_LOGE(TAG, "Wi-Fi stop failed: %s", esp_err_to_name(result));
+        }
+        s_wifi_transition = false;
+        return result;
+    }
+
+    s_wifi_enabled = true;
+    esp_err_t result = s_setup_pop[0] != '\0'
+                           ? configure_softap(s_setup_pop)
+                           : esp_wifi_set_mode(WIFI_MODE_STA);
+    if (result == ESP_OK) result = migrate_legacy_wifi_if_present();
+    if (result == ESP_OK) result = esp_wifi_start();
+    if (result == ESP_OK) {
+        result = esp_wifi_set_ps(s_wifi_sleep_power_save
+                                     ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
+    }
+    if (result == ESP_OK && s_softap_ready) {
+        esp_err_t portal_result = baby_tank_wifi_portal_start();
+        if (portal_result != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi enabled but setup page failed: %s",
+                     esp_err_to_name(portal_result));
+        }
+    }
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "Wi-Fi enabled by authenticated BLE command");
+    } else {
+        s_wifi_enabled = false;
+        s_softap_ready = false;
+        ESP_LOGE(TAG, "Wi-Fi start failed: %s", esp_err_to_name(result));
+    }
+    s_wifi_transition = false;
+    return result;
 }
 
 bool baby_tank_network_cloud_is_ready(void)
@@ -1021,5 +1414,5 @@ bool baby_tank_network_cloud_is_ready(void)
 
 bool baby_tank_network_softap_is_ready(void)
 {
-    return s_softap_ready;
+    return s_wifi_enabled && s_softap_ready;
 }

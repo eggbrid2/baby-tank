@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090c0b">
+  <title>Baby Tank Cloud</title>
+  <link rel="stylesheet" href="/cloud.css">
+</head>
+<body>
+  <header><a class="cloud-brand" href="/"><span class="mini-face"><i></i><i></i></span>Baby Tank</a><span>Cloud</span></header>
+  <main>
+    <section class="cloud-visual" aria-label="Baby Tank Cloud">
+      <div class="cloud-grid"></div>
+      <div class="cloud-face" aria-hidden="true"><i></i><i></i><b></b></div>
+      <div class="visual-copy"><span>YOUR TANK. YOUR CLOUD.</span><h1>它认识的，<br>只属于你。</h1><p>每个账号拥有独立的设备、AI 配置与数据空间。</p></div>
+    </section>
+    <section class="cloud-panel">
+      <div class="auth-shell" data-auth-shell>
+        <div class="auth-tabs" role="tablist"><button class="active" type="button" data-tab="login">登录</button><button type="button" data-tab="register">注册</button></div>
+        <form data-form="login">
+          <div class="form-head"><p>欢迎回来</p><h2>进入云端控制台</h2></div>
+          <label><span>邮箱</span><input name="email" type="email" autocomplete="email" required></label>
+          <label><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
+          <button type="submit">登录 <span>→</span></button><p class="status" data-status></p>
+        </form>
+        <form data-form="register" hidden>
+          <div class="form-head"><p>独立账号</p><h2>创建云端账号</h2></div>
+          <label><span>怎么称呼你</span><input name="displayName" maxlength="40" autocomplete="name" required></label>
+          <label><span>邮箱</span><input name="email" type="email" maxlength="254" autocomplete="email" required></label>
+          <label><span>密码</span><input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required><small>至少 12 个字符</small></label>
+          <label class="trap" aria-hidden="true">公司<input name="company" tabindex="-1" autocomplete="off"></label>
+          <label class="check"><input name="guardianConfirmed" type="checkbox" required><span>我是成年人或监护人</span></label>
+          <label class="check"><input name="termsAccepted" type="checkbox" required><span>同意使用以上信息创建账号；目前不提交儿童信息</span></label>
+          <button type="submit">创建账号 <span>→</span></button><p class="status" data-status></p>
+        </form>
+      </div>
+      <div class="account-shell" data-account-shell hidden>
+        <div class="account-top"><div><span>云端账号</span><h2 data-account-name></h2><p data-account-email></p></div><button class="logout" type="button" data-logout>退出</button></div>
+        <div class="device-empty"><div class="empty-face"><i></i><i></i><b></b></div><h3>还没有绑定设备</h3><p>打开 Baby Tank App，扫描设备配对码即可加入这个账号。</p><button type="button" disabled>等待设备绑定</button></div>
+        <p class="account-note">设备、AI 配置与家庭数据会按账号隔离。固件由 Baby Tank 项目统一发布。</p>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/cloud.js"></script>
+</body>
+</html>

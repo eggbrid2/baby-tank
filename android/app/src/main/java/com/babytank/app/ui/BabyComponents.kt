@@ -1,6 +1,5 @@
 package com.babytank.app.ui
 
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.keyframes
@@ -21,9 +20,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +37,7 @@ import kotlin.math.sin
 fun BabyFace(
     modifier: Modifier = Modifier,
     connected: Boolean = false,
+    mood: String? = null,
 ) {
     val transition = rememberInfiniteTransition(label = "baby-face")
     val blink by transition.animateFloat(
@@ -56,131 +58,36 @@ fun BabyFace(
         ),
         label = "blink",
     )
-    val gazeX by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            keyframes {
-                durationMillis = 9200
-                0f at 0
-                0f at 900
-                -0.58f at 1750
-                -0.58f at 3100
-                0.42f at 4400
-                0.42f at 6250
-                0f at 7420
-                0f at 9200
-            },
-        ),
-        label = "gaze-x",
-    )
-    val gazeY by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            keyframes {
-                durationMillis = 10400
-                0f at 0
-                -0.18f at 2400
-                -0.18f at 4300
-                0.12f at 6200
-                0.12f at 8200
-                0f at 10400
-            },
-        ),
-        label = "gaze-y",
-    )
-    val time by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 6.28318f,
-        animationSpec = infiniteRepeatable(
-            animation = keyframes {
-                durationMillis = 4800
-                6.28318f at 4800 using LinearEasing
-            },
-        ),
-        label = "breathing",
-    )
-
     Canvas(modifier = modifier) {
-        val radius = size.minDimension * 0.17f
+        val radius = size.minDimension * 0.13f
         drawRoundRect(
-            brush = Brush.verticalGradient(
-                listOf(Color(0xFF20272A), Color(0xFF111416)),
-            ),
+            color = Color(0xFF101314),
             cornerRadius = CornerRadius(radius),
         )
-        drawRoundRect(
-            color = Color.White.copy(alpha = .08f),
-            cornerRadius = CornerRadius(radius),
-            style = Stroke(width = 1.2.dp.toPx()),
-        )
-        drawArc(
-            color = Color.White.copy(alpha = .055f),
-            startAngle = 196f,
-            sweepAngle = 118f,
-            useCenter = false,
-            topLeft = Offset(size.width * .05f, size.height * .04f),
-            size = Size(size.width * .9f, size.height * .82f),
-            style = Stroke(width = size.minDimension * .012f, cap = StrokeCap.Round),
-        )
-
-        val breathY = sin(time) * size.height * 0.009f
-        val swayX = cos(time) * size.width * 0.003f
-        val eyeWidth = size.minDimension * 0.15f
-        val eyeHeight = size.minDimension * 0.255f * blink
-        val gazeOffsetX = gazeX * size.width * .032f + swayX
-        val gazeOffsetY = gazeY * size.height * .04f + breathY
-        val eyeY = size.height * 0.42f + gazeOffsetY - eyeHeight / 2f
-        val eyeColor = if (connected) Cyan else Color(0xFF78AAA8)
-
-        listOf(size.width * 0.34f, size.width * 0.66f).forEach { baseX ->
-            val centerX = baseX + gazeOffsetX
-            drawCircle(
-                color = eyeColor.copy(alpha = .07f * blink),
-                radius = eyeWidth * 1.05f,
-                center = Offset(centerX, size.height * .42f + gazeOffsetY),
-            )
+        val eyeColor = if (connected) Cyan else Cyan.copy(alpha = .55f)
+        val eyeWidth = size.minDimension * .095f
+        val sleepy = mood == "sleepy"
+        val eyeHeight = size.minDimension * (if (sleepy) .024f else .15f) * blink
+        val eyeY = size.height * .43f - eyeHeight / 2f
+        listOf(size.width * .37f, size.width * .63f).forEach { centerX ->
             drawRoundRect(
-                brush = Brush.verticalGradient(
-                    listOf(eyeColor.copy(alpha = .96f), eyeColor.copy(alpha = .76f)),
-                    startY = eyeY,
-                    endY = eyeY + eyeHeight.coerceAtLeast(3f),
-                ),
+                color = eyeColor,
                 topLeft = Offset(centerX - eyeWidth / 2f, eyeY),
                 size = Size(eyeWidth, eyeHeight.coerceAtLeast(3f)),
                 cornerRadius = CornerRadius(eyeWidth / 2f),
             )
-            if (blink > .45f) {
-                drawRoundRect(
-                    color = Color.White.copy(alpha = .62f),
-                    topLeft = Offset(
-                        centerX - eyeWidth * .22f,
-                        eyeY + eyeHeight * .16f,
-                    ),
-                    size = Size(eyeWidth * .18f, eyeHeight * .19f),
-                    cornerRadius = CornerRadius(eyeWidth * .1f),
-                )
-            }
         }
-
-        val mouthWidth = size.minDimension * .2f
-        val mouthHeight = size.minDimension * .095f
-        drawArc(
-            color = Cream,
-            startAngle = 18f,
-            sweepAngle = 144f,
-            useCenter = false,
-            topLeft = Offset(size.width / 2f - mouthWidth / 2f, size.height * .59f + breathY),
-            size = Size(mouthWidth, mouthHeight),
-            style = Stroke(width = size.minDimension * .022f, cap = StrokeCap.Round),
-        )
-        if (connected) {
-            drawCircle(
-                color = Color(0xFF72F2A9),
-                radius = size.minDimension * 0.018f,
-                center = Offset(size.width * 0.9f, size.height * 0.14f),
-            )
+        val mouthWidth = size.minDimension * (if (mood == "happy" || mood == "excited") .24f else .15f)
+        if (mood == "sad" || mood == "worried" || mood == "annoyed") {
+            drawArc(eyeColor, 200f, 140f, false,
+                Offset(size.width / 2f - mouthWidth / 2f, size.height * .64f),
+                Size(mouthWidth, size.minDimension * .08f),
+                style = Stroke(width = size.minDimension * .018f, cap = StrokeCap.Round))
+        } else {
+            drawArc(eyeColor, 20f, 140f, false,
+                Offset(size.width / 2f - mouthWidth / 2f, size.height * .6f),
+                Size(mouthWidth, size.minDimension * .08f),
+                style = Stroke(width = size.minDimension * .018f, cap = StrokeCap.Round))
         }
     }
 }
@@ -188,7 +95,7 @@ fun BabyFace(
 enum class GlyphKind {
     Home, Pair, Control, Lab, Character, Signal, Camera, Settings,
     Up, Down, Left, Right, Stop, Light, RainbowLight, NightLight,
-    Horn, Cannon, Dialogue,
+    Horn, Cannon, Dialogue, Food, Water, Sleep,
 }
 
 @Composable
@@ -207,7 +114,21 @@ fun MiniGlyph(
                 drawLine(color, Offset(size.width * .5f, size.height * .2f), Offset(size.width * .82f, size.height * .48f), stroke.width)
                 drawRoundRect(color, Offset(size.width * .26f, size.height * .43f), Size(size.width * .48f, size.height * .42f), CornerRadius(4f), style = stroke)
             }
-            GlyphKind.Pair, GlyphKind.Signal -> {
+            GlyphKind.Pair -> {
+                val x = size.width
+                val y = size.height
+                drawLine(color, Offset(x * .5f, y * .12f),
+                    Offset(x * .5f, y * .88f), stroke.width, StrokeCap.Round)
+                drawLine(color, Offset(x * .5f, y * .12f),
+                    Offset(x * .73f, y * .31f), stroke.width, StrokeCap.Round)
+                drawLine(color, Offset(x * .73f, y * .31f),
+                    Offset(x * .27f, y * .69f), stroke.width, StrokeCap.Round)
+                drawLine(color, Offset(x * .27f, y * .31f),
+                    Offset(x * .73f, y * .69f), stroke.width, StrokeCap.Round)
+                drawLine(color, Offset(x * .73f, y * .69f),
+                    Offset(x * .5f, y * .88f), stroke.width, StrokeCap.Round)
+            }
+            GlyphKind.Signal -> {
                 drawCircle(color, size.width * .09f, Offset(size.width * .5f, size.height * .76f))
                 drawArc(color, 205f, 130f, false, Offset(size.width * .32f, size.height * .42f), Size(size.width * .36f, size.height * .36f), style = stroke)
                 drawArc(color, 205f, 130f, false, Offset(size.width * .16f, size.height * .23f), Size(size.width * .68f, size.height * .68f), style = stroke)
@@ -216,7 +137,7 @@ fun MiniGlyph(
                 drawCircle(color, size.width * .34f, center, style = stroke)
                 drawCircle(color, size.width * .10f, center)
             }
-            GlyphKind.Lab, GlyphKind.Settings -> {
+            GlyphKind.Lab -> {
                 drawCircle(color, size.width * .30f, center, style = stroke)
                 drawCircle(color, size.width * .08f, center)
                 repeat(4) { index ->
@@ -225,6 +146,32 @@ fun MiniGlyph(
                     val end = if (horizontal) Offset(size.width * .92f, size.height * .5f) else Offset(size.width * .5f, size.height * .92f)
                     drawLine(color, start, end, stroke.width)
                 }
+            }
+            GlyphKind.Settings -> {
+                val gear = Path().apply { fillType = PathFillType.EvenOdd }
+                repeat(8) { index ->
+                    val axis = index * Math.PI / 4.0 - Math.PI / 2.0
+                    val profile = arrayOf(
+                        -Math.PI / 8.0 to .30f,
+                        -Math.PI / 16.0 to .30f,
+                        -Math.PI / 16.0 to .41f,
+                        Math.PI / 16.0 to .41f,
+                        Math.PI / 16.0 to .30f,
+                        Math.PI / 8.0 to .30f,
+                    )
+                    profile.forEach { (offset, radius) ->
+                        val x = size.width * (.5f + radius * cos(axis + offset).toFloat())
+                        val y = size.height * (.5f + radius * sin(axis + offset).toFloat())
+                        if (index == 0 && offset == -Math.PI / 8.0) gear.moveTo(x, y)
+                        else gear.lineTo(x, y)
+                    }
+                }
+                gear.close()
+                gear.addOval(Rect(
+                    center = center,
+                    radius = size.width * .115f,
+                ))
+                drawPath(gear, color)
             }
             GlyphKind.Character -> {
                 drawCircle(color, size.width * .20f, Offset(size.width * .5f, size.height * .35f), style = stroke)
@@ -329,6 +276,50 @@ fun MiniGlyph(
                     Offset(size.width * .39f, size.height * .46f))
                 drawCircle(color, size.width * .045f,
                     Offset(size.width * .61f, size.height * .46f))
+            }
+            GlyphKind.Food -> {
+                drawArc(color, 0f, 180f, false,
+                    Offset(size.width * .16f, size.height * .31f),
+                    Size(size.width * .68f, size.height * .52f), style = stroke)
+                drawLine(color, Offset(size.width * .2f, size.height * .57f),
+                    Offset(size.width * .8f, size.height * .57f), stroke.width,
+                    StrokeCap.Round)
+                drawLine(color, Offset(size.width * .33f, size.height * .78f),
+                    Offset(size.width * .67f, size.height * .78f), stroke.width,
+                    StrokeCap.Round)
+            }
+            GlyphKind.Water -> {
+                val drop = Path().apply {
+                    moveTo(size.width * .5f, size.height * .12f)
+                    cubicTo(size.width * .42f, size.height * .28f,
+                        size.width * .23f, size.height * .5f,
+                        size.width * .23f, size.height * .65f)
+                    cubicTo(size.width * .23f, size.height * .84f,
+                        size.width * .36f, size.height * .91f,
+                        size.width * .5f, size.height * .91f)
+                    cubicTo(size.width * .64f, size.height * .91f,
+                        size.width * .77f, size.height * .84f,
+                        size.width * .77f, size.height * .65f)
+                    cubicTo(size.width * .77f, size.height * .5f,
+                        size.width * .58f, size.height * .28f,
+                        size.width * .5f, size.height * .12f)
+                    close()
+                }
+                drawPath(drop, color, style = stroke)
+            }
+            GlyphKind.Sleep -> {
+                drawArc(color, 75f, 225f, false,
+                    Offset(size.width * .17f, size.height * .13f),
+                    Size(size.width * .62f, size.height * .68f), style = stroke)
+                drawLine(color, Offset(size.width * .62f, size.height * .73f),
+                    Offset(size.width * .82f, size.height * .73f), stroke.width,
+                    StrokeCap.Round)
+                drawLine(color, Offset(size.width * .82f, size.height * .73f),
+                    Offset(size.width * .62f, size.height * .9f), stroke.width,
+                    StrokeCap.Round)
+                drawLine(color, Offset(size.width * .62f, size.height * .9f),
+                    Offset(size.width * .82f, size.height * .9f), stroke.width,
+                    StrokeCap.Round)
             }
         }
     }

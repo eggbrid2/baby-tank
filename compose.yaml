@@ -2,6 +2,8 @@ services:
   baby-tank-cloud:
     build: .
     restart: unless-stopped
+    init: true
+    mem_limit: 512m
     env_file: .env
     volumes:
       - ${BABY_TANK_DATA_DIR:-./data}:/data

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { conversationMessages, explicitDrawIntent, explicitDriveIntent, explicitLookIntent, explicitSleepIntent,
+import { conversationMessages, drawingMessages, driveDecisionMessages, explicitDrawIntent, explicitDriveIntent,
+  explicitLookIntent, explicitSleepIntent, modelDriveSafetyReason, parseDriveDecision,
   parseConversationReply, parseDrawingProposal } from '../src/conversation.mjs';
 
 test('camera attachment requires a visual ASR intent', () => {
@@ -17,7 +18,7 @@ test('camera attachment requires a visual ASR intent', () => {
 test('conversation parser keeps model action proposals strictly bounded', () => {
   const prompt = conversationMessages('前进一步', [], {});
   assert.match(prompt[0].content, /action/);
-  assert.match(prompt[0].content, /自主判断移动是否/);
+  assert.match(prompt[0].content, /普通对话不能自行移动/);
 
   const forward = parseConversationReply(JSON.stringify({ reply: '好', emotion: 'happy', intensity: 60,
     action: { type: 'drive', direction: 'forward', durationMs: 2000 } }));
@@ -73,7 +74,7 @@ test('conversation parser keeps model action proposals strictly bounded', () => 
     .speechSegments.length, 1);
 });
 
-test('AI drawing accepts only layouts backed by bundled designer SVG assets', () => {
+test('AI drawing accepts model-authored safe SVG, never emoji layouts', () => {
   assert.match(conversationMessages('讲个故事', [], {})[0].content,
     /即使孩子没有直接命令画画/);
   assert.equal(explicitDrawIntent('画辆自行车'), true);
@@ -81,22 +82,24 @@ test('AI drawing accepts only layouts backed by bundled designer SVG assets', ()
   assert.equal(explicitDrawIntent('给我画一幅画'), true);
   assert.equal(explicitDrawIntent('你会画画吗'), false);
   assert.equal(explicitDrawIntent('不要画小汽车'), false);
-  const items = [{ emoji: '🐈', x: 98, y: 126, size: 150, rotation: 0, flipX: false },
-    { emoji: '🧶', x: 190, y: 158, size: 62, rotation: 0, flipX: false }];
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">' +
+    '<rect x="0" y="0" width="240" height="240" fill="#071018"/>' +
+    '<circle cx="120" cy="120" r="50" fill="#59f3e8"/>' +
+    '<circle cx="120" cy="120" r="18" fill="#fff1c7"/>' +
+    '<circle cx="120" cy="120" r="7" fill="#ff8fb8"/></svg>';
   assert.deepEqual(parseDrawingProposal(`\`\`\`json\n${JSON.stringify({ drawing: {
-    durationMs: 6000, items,
-  } })}\n\`\`\``), { durationMs: 6000, items: [
-    { iconName: 'cat', ...items[0] }, { iconName: 'yarn', ...items[1] },
-  ] });
+    durationMs: 15000, svg,
+  } })}\n\`\`\``), { durationMs: 15000, svg });
+  assert.match(drawingMessages('画辆自行车')[0].content, /不使用 emoji/);
   assert.equal(parseDrawingProposal(JSON.stringify({ drawing: {
-    durationMs: 6000, items: [{ emoji: 'A', x: 120, y: 120, size: 180 }],
+    durationMs: 15000, items: [{ emoji: 'A', x: 120, y: 120, size: 180 }],
   } })), null);
   assert.equal(parseDrawingProposal(JSON.stringify({ drawing: {
-    durationMs: 6000, items: [{ emoji: '🐈', x: 30, y: 120, size: 180 }],
+    durationMs: 15000, svg: svg.replace('<circle', '<image href="https://bad">'),
   } })), null);
   assert.equal(parseConversationReply(JSON.stringify({ reply: '画好了',
-    drawing: { durationMs: 6000, items } })).drawing, null,
-  'the dialogue model cannot bypass the dedicated curated renderer');
+    drawing: { durationMs: 15000, svg } })).drawing, null,
+  'the dialogue model cannot bypass the dedicated SVG renderer');
   assert.deepEqual(parseConversationReply(JSON.stringify({ reply: '我想到一幅小画。',
     drawing: { subject: '一只追毛线的小猫' }, action: null, camera: null })).drawing,
   { subject: '一只追毛线的小猫' });
@@ -110,13 +113,13 @@ test('AI drawing accepts only layouts backed by bundled designer SVG assets', ()
     null);
 });
 
-test('explicit drive grammar stays narrow as the deterministic fallback', () => {
+test('recognizable drive grammar can detect conflicts without authorizing motion', () => {
   for (const [utterance, direction, durationMs] of [
     ['向前走一步', 'forward', null], ['请你后退一下', 'backward', null],
     ['喵喵同学左转一下', 'left', null], ['坦克向右转', 'right', null],
     ['前进3秒', 'forward', 3000], ['向右转2.5秒', 'right', 2500],
     ['向前走两秒', 'forward', 2000], ['后退三秒吧', 'backward', 3000],
-    ['左转一下吧', 'left', null],
+    ['左转一下吧', 'left', null], ['往后走一点', 'backward', null],
     ['让你往后走一点', 'backward', null],
   ]) assert.deepEqual(explicitDriveIntent(utterance), { direction, durationMs });
   for (const utterance of ['为什么不能前进？', '不要向前走', '如果向前走会怎样',
@@ -124,6 +127,22 @@ test('explicit drive grammar stays narrow as the deterministic fallback', () => 
     '不要让你往后走一点', '我说让你往后走一点吗']) {
     assert.equal(explicitDriveIntent(utterance), null);
   }
+});
+
+test('model proposes motion; deterministic logic only vetoes unsafe context', () => {
+  assert.match(driveDecisionMessages('往后退一步')[0].content, /行走工具选择器/);
+  assert.deepEqual(parseDriveDecision('{"action":{"type":"drive","direction":"backward","durationMs":2000}}'),
+    { status: 'shadow', type: 'drive', direction: 'backward', speedPerMille: 900,
+      durationMs: 2000, lightMode: 'unchanged', reason: '' });
+  assert.equal(parseDriveDecision('{"action":null}').status, 'none');
+  assert.equal(parseDriveDecision('{"action":{"type":"drive","direction":"backward","durationMs":9001}}').status,
+    'rejected');
+  const backward = { type: 'drive', direction: 'backward', durationMs: 2000 };
+  assert.equal(modelDriveSafetyReason('往后退一步', backward), null);
+  assert.equal(modelDriveSafetyReason('请你往后退一步', backward), null);
+  assert.equal(modelDriveSafetyReason('为什么不能后退？', backward), 'drive_question_veto');
+  assert.equal(modelDriveSafetyReason('不要往后退一步', backward), 'drive_negation_veto');
+  assert.equal(modelDriveSafetyReason('往前走一步', backward), 'drive_direction_conflict');
 });
 
 test('an exploration reply is short and does not promise an unseen scene', () => {

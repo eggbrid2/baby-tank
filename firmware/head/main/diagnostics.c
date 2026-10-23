@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,8 @@
 #include "network_runtime.h"
 #include "touch_wake.h"
 #include "voice_runtime.h"
+#include "runtime_policy.h"
+#include "interaction_memory.h"
 
 typedef enum {
     DIAGNOSTIC_STATUS = 0,
@@ -31,6 +34,12 @@ typedef enum {
     DIAGNOSTIC_CANNON = 7,
     DIAGNOSTIC_VOLUME = 8,
     DIAGNOSTIC_GAME_RESULT = 9,
+    DIAGNOSTIC_FEED_RESULT = 10,
+    DIAGNOSTIC_POKE = 11,
+    DIAGNOSTIC_SLEEP = 12,
+    DIAGNOSTIC_STOP_LISTEN = 13,
+    DIAGNOSTIC_RESTART = 14,
+    DIAGNOSTIC_SETUP_HOTSPOT = 15,
 } diagnostic_opcode_t;
 
 typedef enum {
@@ -42,6 +51,36 @@ typedef enum {
 
 static portMUX_TYPE s_tone_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_tone_busy;
+static bool s_restart_scheduled;
+
+static void diagnostic_restart(void *argument)
+{
+    (void)argument;
+    /* Leave enough time for the encrypted BLE endpoint to return its ACK.
+     * The chassis is stopped before this task is scheduled. */
+    vTaskDelay(pdMS_TO_TICKS(800U));
+    esp_restart();
+}
+
+static diagnostic_status_t schedule_restart(void)
+{
+    taskENTER_CRITICAL(&s_tone_lock);
+    if (s_restart_scheduled) {
+        taskEXIT_CRITICAL(&s_tone_lock);
+        return DIAGNOSTIC_BUSY;
+    }
+    s_restart_scheduled = true;
+    taskEXIT_CRITICAL(&s_tone_lock);
+    (void)baby_tank_chassis_bridge_stop();
+    if (xTaskCreate(diagnostic_restart, "diagnostic_restart", 2048U,
+                    NULL, 8, NULL) != pdPASS) {
+        taskENTER_CRITICAL(&s_tone_lock);
+        s_restart_scheduled = false;
+        taskEXIT_CRITICAL(&s_tone_lock);
+        return DIAGNOSTIC_UNAVAILABLE;
+    }
+    return DIAGNOSTIC_OK;
+}
 
 static void write_u16(uint8_t *destination, uint16_t value)
 {
@@ -59,6 +98,13 @@ static void write_u32(uint8_t *destination, uint32_t value)
 
 static void diagnostic_tone(void *argument)
 {
+    if (baby_tank_policy_is_locked()) {
+        taskENTER_CRITICAL(&s_tone_lock);
+        s_tone_busy = false;
+        taskEXIT_CRITICAL(&s_tone_lock);
+        vTaskDelete(NULL);
+        return;
+    }
     unsigned variant = (unsigned)(uintptr_t)argument;
     int16_t samples[160];
     if (variant == 6U) {
@@ -148,10 +194,59 @@ static diagnostic_status_t start_tone(uint8_t variant)
     return DIAGNOSTIC_OK;
 }
 
-static diagnostic_status_t run_command(const uint8_t *input)
+static diagnostic_status_t submit_feed_reaction(baby_tank_feed_reaction_t reaction)
+{
+    baby_tank_expression_t expression = BABY_TANK_EXPRESSION_HAPPY;
+    uint8_t intensity = 78U;
+    switch (reaction) {
+    case BABY_TANK_FEED_REACTION_FAVORITE:
+        expression = BABY_TANK_EXPRESSION_LOVE;
+        intensity = 96U;
+        break;
+    case BABY_TANK_FEED_REACTION_LESS_PREFERRED:
+        expression = BABY_TANK_EXPRESSION_CONFUSED;
+        intensity = 72U;
+        break;
+    case BABY_TANK_FEED_REACTION_REPEATED:
+        expression = BABY_TANK_EXPRESSION_ANNOYED;
+        intensity = 86U;
+        break;
+    case BABY_TANK_FEED_REACTION_AFTER_MEAL_DRINK:
+        expression = BABY_TANK_EXPRESSION_SHY;
+        intensity = 88U;
+        break;
+    case BABY_TANK_FEED_REACTION_NORMAL:
+    default:
+        break;
+    }
+    const baby_tank_face_request_t request = {
+        .expression = expression,
+        .duration_ms = 4200U,
+        .intensity = intensity,
+        .priority = BABY_TANK_FACE_PRIORITY_INTERACTION,
+    };
+    return baby_tank_face_submit(&request) == ESP_OK
+               ? DIAGNOSTIC_OK : DIAGNOSTIC_UNAVAILABLE;
+}
+
+static diagnostic_status_t run_command(const uint8_t *input, uint8_t *detail)
 {
     diagnostic_opcode_t opcode = (diagnostic_opcode_t)input[1];
-    if (opcode != DIAGNOSTIC_STATUS && opcode != DIAGNOSTIC_VOLUME) {
+    if (baby_tank_policy_is_locked() &&
+        opcode != DIAGNOSTIC_STATUS &&
+        opcode != DIAGNOSTIC_SLEEP &&
+        opcode != DIAGNOSTIC_STOP_LISTEN &&
+        opcode != DIAGNOSTIC_RESTART &&
+        opcode != DIAGNOSTIC_SETUP_HOTSPOT &&
+        !(opcode == DIAGNOSTIC_REMOTE_MODE && input[2] == 0U)) {
+        return DIAGNOSTIC_UNAVAILABLE;
+    }
+    /* Closing remote mode is also sent during App background cleanup. It is
+     * not a new child interaction and must not reset the idle-scene timer. */
+    if (opcode != DIAGNOSTIC_STATUS && opcode != DIAGNOSTIC_VOLUME &&
+        opcode != DIAGNOSTIC_SLEEP && opcode != DIAGNOSTIC_STOP_LISTEN &&
+        opcode != DIAGNOSTIC_RESTART && opcode != DIAGNOSTIC_SETUP_HOTSPOT &&
+        !(opcode == DIAGNOSTIC_REMOTE_MODE && input[2] == 0U)) {
         (void)baby_tank_face_note_activity();
     }
     switch (opcode) {
@@ -220,14 +315,69 @@ static diagnostic_status_t run_command(const uint8_t *input)
                    ? DIAGNOSTIC_OK : DIAGNOSTIC_UNAVAILABLE;
     case DIAGNOSTIC_GAME_RESULT:
         if (input[2] > 2U) return DIAGNOSTIC_INVALID;
-        return start_tone((uint8_t)(7U + input[2]));
+        {
+            diagnostic_status_t result = start_tone((uint8_t)(7U + input[2]));
+            if (result != DIAGNOSTIC_OK) return result;
+            uint8_t streak = baby_tank_interaction_memory_note_game(input[2]);
+            if (detail != NULL) *detail = streak;
+            /* A wrong drawing guess should read as an immediate emotional
+             * response, not just a neutral spoken result. Repeated misses
+             * escalate from sad to crying; other games retain streak-based
+             * reactions. */
+            if (input[2] == 1U || streak >= 3U) {
+                const baby_tank_face_request_t request = {
+                    .expression = input[2] == 0U
+                                      ? BABY_TANK_EXPRESSION_PROUD
+                                      : input[2] == 1U
+                                            ? (streak >= 3U
+                                                   ? BABY_TANK_EXPRESSION_CRYING
+                                                   : BABY_TANK_EXPRESSION_SAD)
+                                            : BABY_TANK_EXPRESSION_CURIOUS,
+                    .duration_ms = input[2] == 1U ? 5200U : 4000U,
+                    .intensity = input[2] == 1U ? 96U : 88U,
+                    .priority = BABY_TANK_FACE_PRIORITY_INTERACTION,
+                };
+                (void)baby_tank_face_submit(&request);
+            }
+            return DIAGNOSTIC_OK;
+        }
+    case DIAGNOSTIC_FEED_RESULT:
+        if (input[2] < BABY_TANK_EXPRESSION_STRAWBERRY ||
+            input[2] > BABY_TANK_EXPRESSION_COCOA) {
+            return DIAGNOSTIC_INVALID;
+        }
+        {
+            baby_tank_feed_reaction_t reaction =
+                baby_tank_interaction_memory_note_feed(input[2]);
+            if (detail != NULL) *detail = (uint8_t)reaction;
+            return submit_feed_reaction(reaction);
+        }
+    case DIAGNOSTIC_POKE:
+        {
+            esp_err_t result = baby_tank_voice_runtime_request_touch_reaction(
+                (esp_random() & 1U) != 0U ? BABY_TANK_TOUCH_REACTION_LEFT
+                                         : BABY_TANK_TOUCH_REACTION_RIGHT);
+            return result == ESP_OK ? DIAGNOSTIC_OK : DIAGNOSTIC_BUSY;
+        }
+    case DIAGNOSTIC_SLEEP:
+        return baby_tank_voice_runtime_request_sleep() == ESP_OK
+                   ? DIAGNOSTIC_OK : DIAGNOSTIC_UNAVAILABLE;
+    case DIAGNOSTIC_STOP_LISTEN:
+        return baby_tank_voice_runtime_cancel_conversation() == ESP_OK
+                   ? DIAGNOSTIC_OK : DIAGNOSTIC_UNAVAILABLE;
+    case DIAGNOSTIC_RESTART:
+        return schedule_restart();
+    case DIAGNOSTIC_SETUP_HOTSPOT:
+        if (input[2] > 1U) return DIAGNOSTIC_INVALID;
+        return baby_tank_network_set_setup_hotspot(input[2] != 0U) == ESP_OK
+                   ? DIAGNOSTIC_OK : DIAGNOSTIC_UNAVAILABLE;
     default:
         return DIAGNOSTIC_INVALID;
     }
 }
 
 static void fill_snapshot(uint8_t *response, diagnostic_status_t status,
-                          uint8_t opcode)
+                          uint8_t opcode, uint8_t detail)
 {
     response[0] = BABY_TANK_DIAGNOSTICS_VERSION;
     response[1] = opcode | 0x80U;
@@ -268,8 +418,10 @@ static void fill_snapshot(uint8_t *response, diagnostic_status_t status,
     }
     response[9] = (uint8_t)baby_tank_network_internet_phase();
     response[10] = (uint8_t)baby_tank_network_web_wifi_phase();
-    response[11] = baby_tank_voice_runtime_remote_mode() ? 1U : 0U;
+    response[11] = (baby_tank_voice_runtime_remote_mode() ? 1U : 0U) |
+                   (baby_tank_network_setup_hotspot_is_enabled() ? 1U << 1 : 0U);
     response[38] = baby_tank_audio_io_get_volume();
+    response[39] = detail;
     write_u32(response + 12U,
               (uint32_t)(esp_timer_get_time() / 1000000LL));
     write_u32(response + 16U,
@@ -290,8 +442,9 @@ esp_err_t baby_tank_diagnostics_endpoint(uint32_t session_id,
         output_size == NULL) return ESP_ERR_INVALID_ARG;
     uint8_t *response = calloc(1, BABY_TANK_DIAGNOSTICS_RESPONSE_SIZE);
     if (response == NULL) return ESP_ERR_NO_MEM;
-    diagnostic_status_t status = run_command(input);
-    fill_snapshot(response, status, input[1]);
+    uint8_t detail = 0U;
+    diagnostic_status_t status = run_command(input, &detail);
+    fill_snapshot(response, status, input[1], detail);
     *output = response;
     *output_size = BABY_TANK_DIAGNOSTICS_RESPONSE_SIZE;
     return ESP_OK;

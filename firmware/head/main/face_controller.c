@@ -15,6 +15,9 @@
 #include "freertos/task.h"
 
 #include "conversation.h"
+#include "runtime_policy.h"
+#include "state_event_queue.h"
+#include "voice_runtime.h"
 
 #define FACE_FRAME_INTERVAL_MS 50U
 #define FACE_REQUEST_QUEUE_LENGTH 8U
@@ -26,6 +29,18 @@
 #define FACE_MAX_INTENSITY 100U
 #define FACE_NORMAL_IDLE_MS 60000U
 #define FACE_BORED_IDLE_MS 30000U
+#define FACE_TIME_BAND_FRESH_MS (15U * 60U * 1000U)
+#define FACE_DAY_SCENE_DURATION_MS (60U * 60U * 1000U)
+
+typedef enum {
+    FACE_BAND_UNKNOWN = 0,
+    FACE_BAND_MORNING,
+    FACE_BAND_MIDDAY,
+    FACE_BAND_AFTERNOON,
+    FACE_BAND_EARLY_EVENING,
+    FACE_BAND_EVENING,
+    FACE_BAND_LATE_NIGHT,
+} face_time_band_t;
 
 static const char *TAG = "baby_tank_face";
 
@@ -45,28 +60,76 @@ static baby_tank_presence_state_t s_presence_state =
     BABY_TANK_PRESENCE_NORMAL;
 static baby_tank_expression_t s_idle_expression = BABY_TANK_EXPRESSION_CALM;
 static uint8_t s_idle_intensity = 45U;
+static face_time_band_t s_time_band = FACE_BAND_UNKNOWN;
+static TickType_t s_time_band_updated;
+static baby_tank_scene_t s_preview_scene = BABY_TANK_SCENE_COUNT;
+static TickType_t s_preview_started;
+static TickType_t s_preview_until;
+
+static bool read_scene_preview(TickType_t now, baby_tank_scene_t *scene,
+                               TickType_t *started)
+{
+    taskENTER_CRITICAL(&s_idle_lock);
+    bool active = s_preview_scene < BABY_TANK_SCENE_COUNT &&
+                  (int32_t)(s_preview_until - now) > 0;
+    if (active) {
+        *scene = s_preview_scene;
+        *started = s_preview_started;
+    } else {
+        s_preview_scene = BABY_TANK_SCENE_COUNT;
+        s_preview_until = 0U;
+    }
+    taskEXIT_CRITICAL(&s_idle_lock);
+    return active;
+}
 
 static void read_idle_state(bool *forced_standby,
                             TickType_t *last_activity_tick,
                             baby_tank_expression_t *expression,
-                            uint8_t *intensity)
+                            uint8_t *intensity,
+                            face_time_band_t *time_band,
+                            TickType_t *time_band_updated)
 {
     taskENTER_CRITICAL(&s_idle_lock);
     *forced_standby = s_forced_standby;
     *last_activity_tick = s_last_activity_tick;
     *expression = s_idle_expression;
     *intensity = s_idle_intensity;
+    *time_band = s_time_band;
+    *time_band_updated = s_time_band_updated;
     taskEXIT_CRITICAL(&s_idle_lock);
 }
 
 static baby_tank_presence_state_t presence_for_idle_time(
-    TickType_t now, TickType_t last_activity_tick, bool forced_standby)
+    TickType_t now, TickType_t last_activity_tick, bool forced_standby,
+    face_time_band_t band, TickType_t band_updated)
 {
+    if (baby_tank_policy_is_locked()) return BABY_TANK_PRESENCE_SLEEPING;
     if (forced_standby) return BABY_TANK_PRESENCE_SLEEPING;
     uint32_t idle_ms = (uint32_t)((now - last_activity_tick) *
                                   portTICK_PERIOD_MS);
-    if (idle_ms < FACE_NORMAL_IDLE_MS) return BABY_TANK_PRESENCE_NORMAL;
-    if (idle_ms < FACE_NORMAL_IDLE_MS + FACE_BORED_IDLE_MS) {
+    uint32_t normal_ms = FACE_NORMAL_IDLE_MS;
+    uint32_t bored_ms = FACE_BORED_IDLE_MS;
+    bool daytime = baby_tank_policy_is_daytime();
+    bool band_fresh = band != FACE_BAND_UNKNOWN &&
+        (uint32_t)((now - band_updated) * portTICK_PERIOD_MS) <
+            FACE_TIME_BAND_FRESH_MS;
+    if (band_fresh) {
+        /* A cached cloud band can be stale across 06:00 while offline. The
+         * trusted UTC policy schedule wins for daytime presentation. */
+        daytime = daytime || band <= FACE_BAND_EARLY_EVENING;
+        normal_ms = band == FACE_BAND_MIDDAY ||
+                    band == FACE_BAND_EARLY_EVENING ? 180000U : 120000U;
+        bored_ms = normal_ms == 180000U ? 300000U : 180000U;
+    }
+    if (idle_ms < normal_ms) return BABY_TANK_PRESENCE_NORMAL;
+    /* A verified daytime band stays in BORED between pixel scenes; it must
+     * not silently turn into night sleep after the idle threshold. */
+    /* With no trustworthy wall clock, idleness alone must not be interpreted
+     * as night. The owner chose an awake offline boot; stay in BORED until
+     * time is known, rather than reverting to a sleeping face after 90 s. */
+    if (daytime || !baby_tank_policy_time_known() ||
+        idle_ms < normal_ms + bored_ms) {
         return BABY_TANK_PRESENCE_BORED;
     }
     return BABY_TANK_PRESENCE_SLEEPING;
@@ -115,54 +178,121 @@ static bool valid_priority(baby_tank_face_priority_t priority)
            priority == BABY_TANK_FACE_PRIORITY_SAFETY;
 }
 
-static baby_tank_expression_t ambient_expression_for_mood(
+typedef struct {
+    baby_tank_face_request_t steps[3];
+    uint8_t count;
+    uint8_t variant;
+} ambient_sequence_t;
+
+static uint8_t s_last_ambient_variant = UINT8_MAX;
+
+static ambient_sequence_t ambient_sequence_for_mood(
     baby_tank_expression_t mood)
 {
-    static const baby_tank_expression_t positive[] = {
-        BABY_TANK_EXPRESSION_HAPPY, BABY_TANK_EXPRESSION_CURIOUS,
-        BABY_TANK_EXPRESSION_SHY, BABY_TANK_EXPRESSION_PROUD,
-        BABY_TANK_EXPRESSION_LOVE,
+    static const uint8_t patterns[12][3] = {
+        {0, 1, 0}, {0, 2, 1}, {1, 0, 3}, {2, 0, 1},
+        {0, 3, 2}, {3, 1, 0}, {1, 4, 0}, {4, 0, 2},
+        {2, 1, 4}, {3, 0, 4}, {4, 2, 0}, {1, 3, 2},
     };
-    static const baby_tank_expression_t low[] = {
-        BABY_TANK_EXPRESSION_SAD, BABY_TANK_EXPRESSION_WORRIED,
-        BABY_TANK_EXPRESSION_THINKING, BABY_TANK_EXPRESSION_SLEEPY,
+    static const baby_tank_expression_t calm[] = {
+        BABY_TANK_EXPRESSION_CALM, BABY_TANK_EXPRESSION_CURIOUS,
+        BABY_TANK_EXPRESSION_SHY, BABY_TANK_EXPRESSION_THINKING,
+        BABY_TANK_EXPRESSION_HAPPY,
     };
-    static const baby_tank_expression_t tense[] = {
-        BABY_TANK_EXPRESSION_ANNOYED, BABY_TANK_EXPRESSION_COMPLAINING,
-        BABY_TANK_EXPRESSION_THINKING, BABY_TANK_EXPRESSION_CONFUSED,
+    static const baby_tank_expression_t happy[] = {
+        BABY_TANK_EXPRESSION_HAPPY, BABY_TANK_EXPRESSION_LOVE,
+        BABY_TANK_EXPRESSION_PROUD, BABY_TANK_EXPRESSION_LAUGHING,
+        BABY_TANK_EXPRESSION_SHY,
+    };
+    static const baby_tank_expression_t excited[] = {
+        BABY_TANK_EXPRESSION_EXCITED, BABY_TANK_EXPRESSION_SURPRISED,
+        BABY_TANK_EXPRESSION_LAUGHING, BABY_TANK_EXPRESSION_PROUD,
+        BABY_TANK_EXPRESSION_HAPPY,
     };
     static const baby_tank_expression_t curious[] = {
         BABY_TANK_EXPRESSION_CURIOUS, BABY_TANK_EXPRESSION_THINKING,
         BABY_TANK_EXPRESSION_CONFUSED, BABY_TANK_EXPRESSION_SURPRISED,
+        BABY_TANK_EXPRESSION_SHY,
     };
-    const baby_tank_expression_t *choices = positive;
-    size_t count = sizeof(positive) / sizeof(positive[0]);
+    static const baby_tank_expression_t sleepy[] = {
+        BABY_TANK_EXPRESSION_SLEEPY, BABY_TANK_EXPRESSION_BORED,
+        BABY_TANK_EXPRESSION_THINKING, BABY_TANK_EXPRESSION_WORRIED,
+        BABY_TANK_EXPRESSION_CALM,
+    };
+    static const baby_tank_expression_t sad[] = {
+        BABY_TANK_EXPRESSION_SAD, BABY_TANK_EXPRESSION_WORRIED,
+        BABY_TANK_EXPRESSION_CRYING, BABY_TANK_EXPRESSION_CONFUSED,
+        BABY_TANK_EXPRESSION_BORED,
+    };
+    static const baby_tank_expression_t worried[] = {
+        BABY_TANK_EXPRESSION_WORRIED, BABY_TANK_EXPRESSION_CONFUSED,
+        BABY_TANK_EXPRESSION_THINKING, BABY_TANK_EXPRESSION_SAD,
+        BABY_TANK_EXPRESSION_SHY,
+    };
+    static const baby_tank_expression_t annoyed[] = {
+        BABY_TANK_EXPRESSION_ANNOYED, BABY_TANK_EXPRESSION_COMPLAINING,
+        BABY_TANK_EXPRESSION_ANGRY, BABY_TANK_EXPRESSION_CONFUSED,
+        BABY_TANK_EXPRESSION_FURIOUS,
+    };
+    const baby_tank_expression_t *pool = calm;
+    uint8_t base_intensity = 54U;
     switch (mood) {
+    case BABY_TANK_EXPRESSION_HAPPY:
+    case BABY_TANK_EXPRESSION_LAUGHING:
+    case BABY_TANK_EXPRESSION_LOVE:
+    case BABY_TANK_EXPRESSION_PROUD:
+        pool = happy;
+        base_intensity = 72U;
+        break;
+    case BABY_TANK_EXPRESSION_EXCITED:
+    case BABY_TANK_EXPRESSION_SURPRISED:
+        pool = excited;
+        base_intensity = 82U;
+        break;
+    case BABY_TANK_EXPRESSION_CURIOUS:
+        pool = curious;
+        base_intensity = 66U;
+        break;
+    case BABY_TANK_EXPRESSION_SLEEPY:
+        pool = sleepy;
+        base_intensity = 46U;
+        break;
     case BABY_TANK_EXPRESSION_SAD:
     case BABY_TANK_EXPRESSION_CRYING:
+        pool = sad;
+        base_intensity = 58U;
+        break;
     case BABY_TANK_EXPRESSION_WORRIED:
     case BABY_TANK_EXPRESSION_SICK:
-    case BABY_TANK_EXPRESSION_SLEEPY:
-        choices = low;
-        count = sizeof(low) / sizeof(low[0]);
+        pool = worried;
+        base_intensity = 61U;
         break;
     case BABY_TANK_EXPRESSION_ANNOYED:
     case BABY_TANK_EXPRESSION_COMPLAINING:
     case BABY_TANK_EXPRESSION_ANGRY:
     case BABY_TANK_EXPRESSION_FURIOUS:
-        choices = tense;
-        count = sizeof(tense) / sizeof(tense[0]);
-        break;
-    case BABY_TANK_EXPRESSION_CURIOUS:
-    case BABY_TANK_EXPRESSION_CONFUSED:
-    case BABY_TANK_EXPRESSION_THINKING:
-        choices = curious;
-        count = sizeof(curious) / sizeof(curious[0]);
+        pool = annoyed;
+        base_intensity = 74U;
         break;
     default:
         break;
     }
-    return choices[esp_random() % count];
+    uint8_t variant = (uint8_t)(esp_random() % 12U);
+    if (variant == s_last_ambient_variant) variant = (uint8_t)((variant + 5U) % 12U);
+    s_last_ambient_variant = variant;
+    ambient_sequence_t sequence = {.count = variant % 3U == 0U ? 2U : 3U,
+                                   .variant = variant};
+    for (uint8_t step = 0U; step < sequence.count; ++step) {
+        int intensity = (int)base_intensity +
+            (int)((variant * 7U + step * 5U) % 13U) - 6;
+        sequence.steps[step] = (baby_tank_face_request_t){
+            .expression = pool[patterns[variant][step]],
+            .duration_ms = 800U + (uint32_t)((variant + step * 3U) % 5U) * 170U,
+            .intensity = clamp_intensity((uint8_t)intensity),
+            .priority = BABY_TANK_FACE_PRIORITY_AMBIENT,
+        };
+    }
+    return sequence;
 }
 
 static void publish_snapshot(const baby_tank_face_request_t *active,
@@ -200,14 +330,24 @@ static void face_task(void *context)
 {
     (void)context;
     baby_tank_face_request_t active = {
-        .expression = BABY_TANK_EXPRESSION_SLEEPING,
+        .expression = BABY_TANK_EXPRESSION_CALM,
         .duration_ms = UINT32_MAX,
-        .intensity = 55U,
+        .intensity = 45U,
         .priority = BABY_TANK_FACE_PRIORITY_IDLE,
     };
     TickType_t active_start = xTaskGetTickCount();
     TickType_t frame_wake = active_start;
     TickType_t next_ambient = active_start + pdMS_TO_TICKS(20000U);
+    TickType_t next_scene = 0U;
+    TickType_t scene_started = 0U;
+    bool scene_active = false;
+    baby_tank_scene_t scene = BABY_TANK_SCENE_EXERCISE;
+    baby_tank_scene_t last_scene_rendered = BABY_TANK_SCENE_COUNT;
+    uint32_t last_scene_frame = UINT32_MAX;
+    baby_tank_scene_t previous_scene = BABY_TANK_SCENE_COUNT;
+    baby_tank_scene_t older_scene = BABY_TANK_SCENE_COUNT;
+    ambient_sequence_t ambient_sequence = {0};
+    uint8_t ambient_step = 0U;
     float speech_level = 0.0f;
 
     while (true) {
@@ -220,8 +360,11 @@ static void face_task(void *context)
         TickType_t last_activity_tick;
         baby_tank_expression_t idle_expression;
         uint8_t idle_intensity;
+        face_time_band_t time_band;
+        TickType_t time_band_updated;
         read_idle_state(&forced_standby, &last_activity_tick,
-                        &idle_expression, &idle_intensity);
+                        &idle_expression, &idle_intensity,
+                        &time_band, &time_band_updated);
         baby_tank_conversation_snapshot_t dialogue = {0};
         bool dialogue_awake =
             baby_tank_conversation_ready() &&
@@ -231,7 +374,8 @@ static void face_task(void *context)
             dialogue.phase != BABY_TANK_CONVERSATION_ERROR &&
             dialogue.phase != BABY_TANK_CONVERSATION_DISCONNECTED;
         baby_tank_presence_state_t presence = presence_for_idle_time(
-            now, last_activity_tick, forced_standby);
+            now, last_activity_tick, forced_standby,
+            time_band, time_band_updated);
         /* Conversation state may be changed by cloud/network maintenance.
          * It can keep an already-awake face in NORMAL, but it must never wake
          * a sleeping face. Real touch/voice/app entry points reset the
@@ -250,7 +394,17 @@ static void face_task(void *context)
             desired_idle = BABY_TANK_EXPRESSION_CURIOUS;
             idle_intensity = 68U;
         }
+        if (expired && active.priority == BABY_TANK_FACE_PRIORITY_AMBIENT &&
+            ambient_step < ambient_sequence.count && !standby &&
+            !dialogue_awake) {
+            activate_request(&active, &active_start,
+                             &ambient_sequence.steps[ambient_step++], now);
+            elapsed_ms = 0U;
+            expired = false;
+        }
         if (expired) {
+            ambient_sequence.count = 0U;
+            ambient_step = 0U;
             bool returning_to_idle = active.priority != BABY_TANK_FACE_PRIORITY_IDLE;
             baby_tank_face_request_t idle = {
                 .expression = desired_idle,
@@ -288,6 +442,8 @@ static void face_task(void *context)
             }
         }
         if (has_selected) {
+            ambient_sequence.count = 0U;
+            ambient_step = 0U;
             if (selected.priority >= active.priority ||
                 active.priority == BABY_TANK_FACE_PRIORITY_IDLE) {
                 activate_request(&active, &active_start, &selected, now);
@@ -301,7 +457,100 @@ static void face_task(void *context)
             }
         }
 
-        if (presence == BABY_TANK_PRESENCE_NORMAL && !has_selected &&
+        bool fresh_daytime = time_band >= FACE_BAND_MORNING &&
+            time_band <= FACE_BAND_EARLY_EVENING &&
+            (uint32_t)((now - time_band_updated) * portTICK_PERIOD_MS) <
+                FACE_TIME_BAND_FRESH_MS;
+        uint32_t idle_ms = (uint32_t)((now - last_activity_tick) *
+                                      portTICK_PERIOD_MS);
+        uint32_t normal_ms = time_band == FACE_BAND_MIDDAY ||
+                             time_band == FACE_BAND_EARLY_EVENING ?
+                             180000U : 120000U;
+        uint32_t bored_ms = normal_ms == 180000U ? 300000U : 180000U;
+        baby_tank_scene_t preview_scene = BABY_TANK_SCENE_COUNT;
+        TickType_t preview_started = 0U;
+        bool preview_active = read_scene_preview(now, &preview_scene,
+                                                  &preview_started);
+        if (preview_active && (standby || dialogue_awake ||
+            baby_tank_voice_runtime_remote_mode() ||
+            active.priority >= BABY_TANK_FACE_PRIORITY_AI ||
+            baby_tank_policy_is_locked())) {
+            baby_tank_face_debug_stop_preview();
+            preview_active = false;
+        }
+        bool scene_eligible = baby_tank_policy_time_known() && fresh_daytime &&
+            idle_ms >= normal_ms + bored_ms &&
+            presence == BABY_TANK_PRESENCE_BORED && !dialogue_awake &&
+            !baby_tank_voice_runtime_remote_mode() &&
+            active.priority == BABY_TANK_FACE_PRIORITY_IDLE &&
+            !baby_tank_policy_is_locked() && !preview_active;
+        if (scene_active && (!scene_eligible ||
+            (uint32_t)((now - scene_started) * portTICK_PERIOD_MS) >=
+                FACE_DAY_SCENE_DURATION_MS)) {
+            bool completed = scene_eligible;
+            if (!completed) {
+                ESP_LOGI(TAG,
+                    "pixel idle scene interrupted=%u idle_ms=%" PRIu32
+                    " band=%u fresh=%u presence=%u dialogue=%u remote=%u"
+                    " priority=%u locked=%u",
+                    (unsigned)scene, idle_ms, (unsigned)time_band,
+                    (unsigned)fresh_daytime, (unsigned)presence,
+                    (unsigned)dialogue_awake,
+                    (unsigned)baby_tank_voice_runtime_remote_mode(),
+                    (unsigned)active.priority,
+                    (unsigned)baby_tank_policy_is_locked());
+            }
+            scene_active = false;
+            next_scene = now + pdMS_TO_TICKS(15U * 60U * 1000U);
+            if (completed) {
+                ESP_LOGI(TAG, "pixel idle scene completed=%u", (unsigned)scene);
+                (void)baby_tank_state_event_enqueue(
+                    BABY_TANK_STATE_EVENT_SCENE_COMPLETED);
+            }
+        }
+        if (!scene_active && scene_eligible &&
+            (next_scene == 0U || (int32_t)(now - next_scene) >= 0)) {
+            static const baby_tank_scene_t morning[] = {
+                BABY_TANK_SCENE_EXERCISE, BABY_TANK_SCENE_READING,
+                BABY_TANK_SCENE_BLOCKS, BABY_TANK_SCENE_EXPLORE };
+            static const baby_tank_scene_t midday[] = {
+                BABY_TANK_SCENE_READING, BABY_TANK_SCENE_CLOUDS };
+            static const baby_tank_scene_t afternoon[] = {
+                BABY_TANK_SCENE_EXPLORE, BABY_TANK_SCENE_BLOCKS,
+                BABY_TANK_SCENE_EXERCISE, BABY_TANK_SCENE_CLOUDS };
+            static const baby_tank_scene_t evening[] = {
+                BABY_TANK_SCENE_READING, BABY_TANK_SCENE_CLOUDS,
+                BABY_TANK_SCENE_TIDY };
+            const baby_tank_scene_t *pool = morning;
+            size_t pool_count = sizeof(morning) / sizeof(morning[0]);
+            if (time_band == FACE_BAND_MIDDAY) {
+                pool = midday;
+                pool_count = sizeof(midday) / sizeof(midday[0]);
+            } else if (time_band == FACE_BAND_AFTERNOON) {
+                pool = afternoon;
+                pool_count = sizeof(afternoon) / sizeof(afternoon[0]);
+            } else if (time_band == FACE_BAND_EARLY_EVENING) {
+                pool = evening;
+                pool_count = sizeof(evening) / sizeof(evening[0]);
+            }
+            size_t offset = esp_random() % pool_count;
+            for (size_t trial = 0; trial < pool_count; ++trial) {
+                baby_tank_scene_t candidate = pool[(offset + trial) % pool_count];
+                if (candidate != previous_scene &&
+                    (pool_count <= 2U || candidate != older_scene)) {
+                    scene = candidate;
+                    break;
+                }
+            }
+            older_scene = previous_scene;
+            previous_scene = scene;
+            scene_active = true;
+            scene_started = now;
+            ESP_LOGI(TAG, "pixel idle scene started=%u", (unsigned)scene);
+        }
+
+        if (presence != BABY_TANK_PRESENCE_SLEEPING && !has_selected &&
+            !scene_active && !preview_active &&
             active.priority == BABY_TANK_FACE_PRIORITY_IDLE &&
             (int32_t)(now - next_ambient) >= 0) {
             dialogue = (baby_tank_conversation_snapshot_t){0};
@@ -309,13 +558,13 @@ static void face_task(void *context)
                 dialogue.phase != BABY_TANK_CONVERSATION_IDLE) {
                 next_ambient = now + pdMS_TO_TICKS(5000U);
             } else {
-                baby_tank_face_request_t ambient = {
-                    .expression = ambient_expression_for_mood(idle_expression),
-                    .duration_ms = 2200U,
-                    .intensity = 72U,
-                    .priority = BABY_TANK_FACE_PRIORITY_AMBIENT,
-                };
-                activate_request(&active, &active_start, &ambient, now);
+                baby_tank_expression_t sequence_mood =
+                    presence == BABY_TANK_PRESENCE_BORED
+                        ? BABY_TANK_EXPRESSION_THINKING : idle_expression;
+                ambient_sequence = ambient_sequence_for_mood(sequence_mood);
+                ambient_step = 1U;
+                activate_request(&active, &active_start,
+                                 &ambient_sequence.steps[0], now);
                 elapsed_ms = 0;
             }
         }
@@ -342,11 +591,45 @@ static void face_task(void *context)
                            (int32_t)(s_drawing_until - now) > 0 &&
                            active.priority != BABY_TANK_FACE_PRIORITY_SAFETY;
             if (show_drawing) {
+                if (preview_active) {
+                    baby_tank_face_debug_stop_preview();
+                    preview_active = false;
+                }
+                scene_active = false;
+                next_scene = now + pdMS_TO_TICKS(15U * 60U * 1000U);
                 render_result = baby_tank_display_render_drawing(&s_drawing);
             }
             xSemaphoreGive(s_drawing_mutex);
         }
-        if (!show_drawing) {
+        if (!show_drawing && preview_active &&
+            active.priority == BABY_TANK_FACE_PRIORITY_IDLE) {
+            uint32_t preview_elapsed_ms =
+                (uint32_t)((now - preview_started) * portTICK_PERIOD_MS);
+            uint32_t frame = preview_elapsed_ms / 900U;
+            if (preview_scene != last_scene_rendered ||
+                frame != last_scene_frame) {
+                render_result = baby_tank_display_render_scene(preview_scene,
+                    preview_elapsed_ms);
+                if (render_result == ESP_OK) {
+                    last_scene_rendered = preview_scene;
+                    last_scene_frame = frame;
+                }
+            }
+        } else if (!show_drawing && scene_active) {
+            uint32_t scene_elapsed_ms =
+                (uint32_t)((now - scene_started) * portTICK_PERIOD_MS);
+            uint32_t frame = scene_elapsed_ms / 900U;
+            if (scene != last_scene_rendered || frame != last_scene_frame) {
+                render_result = baby_tank_display_render_scene(scene,
+                    scene_elapsed_ms);
+                if (render_result == ESP_OK) {
+                    last_scene_rendered = scene;
+                    last_scene_frame = frame;
+                }
+            }
+        } else if (!show_drawing) {
+            last_scene_rendered = BABY_TANK_SCENE_COUNT;
+            last_scene_frame = UINT32_MAX;
             render_result = baby_tank_display_render_expression(
                 active.expression, elapsed_ms, active.duration_ms,
                 active.intensity, rendered_speech_level);
@@ -380,6 +663,10 @@ esp_err_t baby_tank_face_controller_start(void)
     s_forced_standby = false;
     s_last_activity_tick = xTaskGetTickCount();
     s_presence_state = BABY_TANK_PRESENCE_NORMAL;
+    s_time_band = FACE_BAND_UNKNOWN;
+    s_time_band_updated = 0U;
+    s_preview_scene = BABY_TANK_SCENE_COUNT;
+    s_preview_until = 0U;
     taskEXIT_CRITICAL(&s_idle_lock);
 
     BaseType_t task_result = xTaskCreate(face_task,
@@ -453,6 +740,28 @@ esp_err_t baby_tank_face_set_mood(const char *emotion, uint8_t intensity)
     return ESP_OK;
 }
 
+esp_err_t baby_tank_face_set_time_band(const char *band)
+{
+    ESP_RETURN_ON_FALSE(band != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "time band is required");
+    static const char *const names[] = {
+        "morning", "midday", "afternoon", "early_evening",
+        "evening", "late_night",
+    };
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (strcmp(band, names[index]) == 0) {
+            taskENTER_CRITICAL(&s_idle_lock);
+            bool changed = s_time_band != (face_time_band_t)(index + 1U);
+            s_time_band = (face_time_band_t)(index + 1U);
+            s_time_band_updated = xTaskGetTickCount();
+            taskEXIT_CRITICAL(&s_idle_lock);
+            if (changed) ESP_LOGI(TAG, "verified time band=%s", band);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
 esp_err_t baby_tank_face_set_standby(bool standby)
 {
     ESP_RETURN_ON_FALSE(s_face_task != NULL, ESP_ERR_INVALID_STATE, TAG,
@@ -461,6 +770,8 @@ esp_err_t baby_tank_face_set_standby(bool standby)
     baby_tank_presence_state_t previous_state = s_presence_state;
     bool was_forced_standby = s_forced_standby;
     s_forced_standby = standby;
+    s_preview_scene = BABY_TANK_SCENE_COUNT;
+    s_preview_until = 0U;
     if (!standby) {
         s_last_activity_tick = xTaskGetTickCount();
     }
@@ -494,6 +805,30 @@ esp_err_t baby_tank_face_get_presence_state(
     return ESP_OK;
 }
 
+esp_err_t baby_tank_face_debug_preview_scene(baby_tank_scene_t scene)
+{
+    ESP_RETURN_ON_FALSE(s_face_task != NULL &&
+                            scene >= 0 && scene < BABY_TANK_SCENE_COUNT,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid scene preview");
+    ESP_RETURN_ON_FALSE(!baby_tank_policy_is_locked(), ESP_ERR_INVALID_STATE,
+                        TAG, "scene preview blocked by policy");
+    TickType_t now = xTaskGetTickCount();
+    taskENTER_CRITICAL(&s_idle_lock);
+    s_preview_scene = scene;
+    s_preview_started = now;
+    s_preview_until = now + pdMS_TO_TICKS(60000U);
+    taskEXIT_CRITICAL(&s_idle_lock);
+    return ESP_OK;
+}
+
+void baby_tank_face_debug_stop_preview(void)
+{
+    taskENTER_CRITICAL(&s_idle_lock);
+    s_preview_scene = BABY_TANK_SCENE_COUNT;
+    s_preview_until = 0U;
+    taskEXIT_CRITICAL(&s_idle_lock);
+}
+
 esp_err_t baby_tank_face_set_thought(const char *thought)
 {
     ESP_RETURN_ON_FALSE(thought != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -508,6 +843,8 @@ esp_err_t baby_tank_face_set_thought(const char *thought)
         {"car", BABY_TANK_THOUGHT_CAR}, {"ball", BABY_TANK_THOUGHT_BALL},
         {"fish", BABY_TANK_THOUGHT_FISH}, {"bubble", BABY_TANK_THOUGHT_BUBBLE},
         {"question", BABY_TANK_THOUGHT_QUESTION}, {"music", BABY_TANK_THOUGHT_MUSIC},
+        {"bird", BABY_TANK_THOUGHT_BIRD}, {"book", BABY_TANK_THOUGHT_BOOK},
+        {"kite", BABY_TANK_THOUGHT_KITE},
     };
     for (size_t index = 0; index < sizeof(thoughts) / sizeof(thoughts[0]); ++index) {
         if (strcmp(thought, thoughts[index].name) == 0) {
@@ -530,7 +867,7 @@ esp_err_t baby_tank_face_submit_drawing(const baby_tank_drawing_t *drawing)
                             drawing->pixel_count ==
                                 BABY_TANK_DRAWING_WIDTH * BABY_TANK_DRAWING_HEIGHT &&
                             drawing->duration_ms >= 4000U &&
-                            drawing->duration_ms <= 8000U,
+                            drawing->duration_ms <= BABY_TANK_DRAWING_MAX_DURATION_MS,
                         ESP_ERR_INVALID_ARG, TAG, "invalid drawing");
     ESP_RETURN_ON_FALSE(s_drawing_mutex != NULL &&
                             xSemaphoreTake(s_drawing_mutex,
